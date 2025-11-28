@@ -1,0 +1,65 @@
+# Compile products
+*.pyc
+*.class
+*.crc
+*.o
+
+# IDE specific
+.scala_dependencies
+.worksheet
+*.iml
+.idea/
+.vscode/
+
+# other
+nohup.out
+*.log
+*.lock
+*.un~
+*.idx
+.ipynb_checkpoints/
+.project
+.settings/
+*/.cache-main
+*/.cache-tests
+*/.classpath
+*/.project
+*/.settings/
+*.so
+*.so.*
+*.dylib
+__pycache__
+*.egg-info
+target
+build
+dist
+*.npy
+*.mmap
+*.pt
+*.slurm
+*.arrow
+*.png
+*.pdf
+*.tex
+*.nfs*
+*.txt
+*.pickle
+
+*/log
+*/data/train
+*/data/eval
+*/out
+
+# debug
+*debug*
+
+# all files in result folder
+*/result/*
+*/save/*
+*/_save/*
+# all files in checkpoints folder
+**/checkpoints*/
+*.json
+
+/test/
+/Figures/
