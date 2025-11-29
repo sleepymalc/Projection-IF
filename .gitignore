@@ -42,7 +42,6 @@ dist
 *.pdf
 *.tex
 *.nfs*
-*.txt
 *.pickle
 
 */log

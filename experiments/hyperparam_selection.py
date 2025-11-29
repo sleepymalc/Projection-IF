@@ -916,7 +916,7 @@ def main():
 
     # Define search spaces
     lambda_values = [1e-9, 1e-8, 1e-7, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1e0, 1e1, 1e2, 1e3, 1e4]
-    m_values = [32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288]
+    m_values = [32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576, 2097152, 4194304]
 
     # Save results with organized directory structure
     experiment_dir = os.path.join(args.output_dir, "hyperparam_selection")
