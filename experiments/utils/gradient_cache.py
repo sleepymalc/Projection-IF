@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Optional, Union, Literal
 from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
-import gc
 import math
 
 import torch
@@ -334,7 +333,7 @@ class GradientCache:
     # Gradient Storage
     # =========================================================================
 
-    def store_gradients(
+    def cache(
         self,
         model: nn.Module,
         dataset,
@@ -401,17 +400,17 @@ class GradientCache:
 
         # Collect gradients for storage modes
         if self.offload == "disk":
-            self._store_gradients_disk(
+            self._store_to_disk(
                 grad_func, params, dataset, indices, device, model_type, batch_size
             )
         else:
-            self._store_gradients_memory(
+            self._store_to_memory(
                 grad_func, params, dataset, indices, device, model_type, batch_size
             )
 
         print(f"Stored {self.n_samples} gradients (dim={self.dim:,})")
 
-    def _store_gradients_memory(
+    def _store_to_memory(
         self, grad_func, params, dataset, indices, device, model_type, batch_size
     ):
         """Store gradients in memory (GPU or CPU)."""
@@ -449,11 +448,6 @@ class GradientCache:
             else:
                 self._memory_storage[i] = grad_flat.to(self.dtype)
 
-        del first_grad_dict, first_batch_data, first_grad
-        gc.collect()
-        if device == "cuda" and torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
         # Process remaining batches
         sample_idx = len(first_batch_indices)
         for batch_start in tqdm(range(batch_size, n_samples, batch_size), desc="Computing gradients"):
@@ -485,15 +479,9 @@ class GradientCache:
                     self._memory_storage[sample_idx] = grad_flat.to(self.dtype)
                 sample_idx += 1
 
-            # Cleanup
-            del grad_dict, batch_data
-            gc.collect()
-            if device == "cuda" and torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
         self.n_samples = n_samples
 
-    def _store_gradients_disk(
+    def _store_to_disk(
         self, grad_func, params, dataset, indices, device, model_type, batch_size
     ):
         """Store gradients to disk in batched files."""
@@ -536,12 +524,6 @@ class GradientCache:
                     current_batch = []
                     current_batch_idx += 1
 
-            # Cleanup
-            del grad_dict, batch_data
-            gc.collect()
-            if device == "cuda" and torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
         # Save remaining gradients
         if current_batch:
             self._save_batch_to_disk(current_batch_idx, torch.stack(current_batch))
@@ -556,20 +538,17 @@ class GradientCache:
     # Unified Access Interface
     # =========================================================================
 
-    def get_sample(self, idx: int, device: Optional[str] = None) -> Tensor:
+    def get_sample(self, idx: int, device: str) -> Tensor:
         """
         Get a single gradient.
 
         Args:
             idx: Index of the gradient
-            device: Target device (defaults to storage device)
+            device: Target device
 
         Returns:
             Gradient tensor of shape (dim,)
         """
-        if device is None:
-            device = self._storage_device or "cpu"
-
         if self.offload == "disk":
             batch_idx, offset = self._sample_to_batch_idx(idx)
             batch_data = self._load_batch_from_disk(batch_idx, device)
@@ -578,21 +557,18 @@ class GradientCache:
             assert self._memory_storage is not None
             return self._memory_storage[idx].to(device)
 
-    def get_batch(self, start: int, end: int, device: Optional[str] = None) -> Tensor:
+    def get_batch(self, start: int, end: int, device: str) -> Tensor:
         """
         Get a range of gradients.
 
         Args:
             start: Starting index (inclusive)
             end: Ending index (exclusive)
-            device: Target device (defaults to storage device)
+            device: Target device
 
         Returns:
             Batched gradient tensor of shape (end - start, dim)
         """
-        if device is None:
-            device = self._storage_device or "cpu"
-
         if self.offload == "disk":
             return self._get_batch_disk(start, end, device)
         else:
@@ -697,7 +673,7 @@ def create_gradient_cache(
     Returns:
         Populated GradientCache object
     """
-    cache = GradientCache(
+    grad_cache = GradientCache(
         offload=offload,
         cache_dir=cache_dir,
         storage_batch_size=batch_size,
@@ -708,13 +684,13 @@ def create_gradient_cache(
     # For disk mode, try to load existing cache
     # Note: is_valid() already loads metadata when it returns True
     if offload == "disk" and not force_recompute:
-        if cache.is_valid(expected_samples=len(indices)):
+        if grad_cache.is_valid(expected_samples=len(indices)):
             print(f"Loading cached gradients from {cache_dir}")
-            cache._storage_device = "cpu"
-            return cache
+            grad_cache._storage_device = "cpu"
+            return grad_cache
 
     # Compute and store gradients
-    cache.store_gradients(
+    grad_cache.cache(
         model=model,
         dataset=dataset,
         indices=indices,
@@ -723,4 +699,4 @@ def create_gradient_cache(
         batch_size=batch_size,
     )
 
-    return cache
+    return grad_cache

@@ -1,37 +1,24 @@
 """Utility functions for projection-hyperparameter experiments."""
 
 from .fisher_utils import (
-    # Memory management
-    clear_memory,
-    # Gradient computation (vmap-based)
-    compute_per_sample_gradients,
-    # Eigenvalue and effective dimension
-    compute_eigenvalues,
-    compute_effective_dimension,
-    estimate_effective_dimension,
-    # Gram matrix and cross-kernel
-    compute_gram_matrix,
-    compute_cross_kernel,
-    # Sandwich bounds (unified interface)
-    compute_sandwich_bounds,
+    # Eigenspectrum (eigenvalues + effective dimensions)
+    compute_eigenspectrum,
+    # Projection utilities
+    project_gradients_to_cpu,
+    compute_kernel_from_projected,
 )
 from .gradient_cache import (
     GradientCache,
+    create_gradient_cache,
 )
 
 __all__ = [
-    # Memory management
-    "clear_memory",
-    # Gradient computation
-    "compute_per_sample_gradients",
     # Fisher utilities
-    "compute_eigenvalues",
-    "compute_effective_dimension",
-    "estimate_effective_dimension",
-    "compute_gram_matrix",
-    "compute_cross_kernel",
-    # Sandwich bounds
-    "compute_sandwich_bounds",
+    "compute_eigenspectrum",
+    # Projection utilities
+    "project_gradients_to_cpu",
+    "compute_kernel_from_projected",
     # Gradient cache
     "GradientCache",
+    "create_gradient_cache",
 ]

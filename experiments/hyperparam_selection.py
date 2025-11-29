@@ -36,7 +36,7 @@ import argparse
 import os
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -47,16 +47,162 @@ experiments_dir = Path(__file__).resolve().parent
 sys.path.insert(0, str(experiments_dir))
 
 from dattri.benchmark.load import load_benchmark
-from dattri.benchmark.utils import SubsetSampler
 from dattri.metric import lds
 from dattri.func.projection import make_random_projector, ProjectionType
 
 from utils.fisher_utils import (
-    compute_eigenvalues,
-    compute_effective_dimension,
-    clear_memory,
+    compute_eigenspectrum,
+    project_gradients_to_cpu,
+    compute_kernel_from_projected,
 )
 from utils.gradient_cache import GradientCache, create_gradient_cache
+
+
+# =============================================================================
+# Sketched Score Computation (specific to this experiment)
+# =============================================================================
+
+def compute_scores_sketched(
+    train_grad_cache: GradientCache,
+    test_grad_cache: GradientCache,
+    projector,
+    lamb: float,
+    device: str = "cuda",
+    batch_size: int = 64,
+) -> torch.Tensor:
+    """
+    Compute sketched influence scores (Pg_train)^T (PFP^T + λI)^{-1} (Pg_test).
+
+    Auto-selects optimal method based on dimensions:
+    - Woodbury (n×n kernel) when n_train < proj_dim
+    - Direct (m×m PFP^T) when proj_dim ≤ n_train
+
+    For self-scores, pass train_grad_cache=test_grad_cache and use result.diag().
+
+    Args:
+        train_grad_cache: Training gradients in GradientCache
+        test_grad_cache: Test gradients in GradientCache
+        projector: Projector with .project() method and .proj_dim attribute
+        lamb: Regularization parameter λ
+        device: GPU device
+        batch_size: Batch size for streaming
+
+    Returns:
+        scores: (n_train, n_test) influence score matrix
+    """
+    n_train = train_grad_cache.n_samples
+    m = projector.proj_dim
+
+    # Auto-select method based on which dimension is smaller
+    if n_train < m:
+        print(f"  Using Woodbury method (n={n_train} < m={m})...")
+        return _compute_scores_woodbury(
+            train_grad_cache, test_grad_cache, projector, lamb, device, batch_size
+        )
+    else:
+        print(f"  Using Direct method (m={m} <= n={n_train})...")
+        return _compute_scores_direct(
+            train_grad_cache, test_grad_cache, projector, lamb, device, batch_size
+        )
+
+
+def _compute_scores_woodbury(
+    train_grad_cache: GradientCache,
+    test_grad_cache: GradientCache,
+    projector,
+    lamb: float,
+    device: str,
+    batch_size: int,
+) -> torch.Tensor:
+    """Compute sketched scores using Woodbury identity (n×n kernel method)."""
+    # 1. Project all gradients
+    PG_train = project_gradients_to_cpu(train_grad_cache, projector, device, batch_size)
+    PG_test = project_gradients_to_cpu(test_grad_cache, projector, device, batch_size)
+
+    # 2. Compute kernel K = PG_train @ PG_train^T (not normalized)
+    K = compute_kernel_from_projected(PG_train, device, batch_size, normalize=False)
+
+    # 3. Compute scores using Woodbury
+    k_A = PG_train.shape[0]
+    k_B = PG_test.shape[0]
+    dtype = PG_train.dtype
+
+    # K_cross = PA @ PB^T
+    print(f"  Computing cross-product ({k_A}×{k_B})...")
+    K_cross = torch.zeros(k_A, k_B, device=device, dtype=dtype)
+    cross_batch = 256
+    for i_start in tqdm(range(0, k_A, cross_batch), desc="  Cross-product", leave=False):
+        i_end = min(i_start + cross_batch, k_A)
+        pa_i = PG_train[i_start:i_end].to(device)
+        PB_gpu = PG_test.to(device)
+        K_cross[i_start:i_end] = pa_i @ PB_gpu.T
+
+    # Solve (K + k_A*λI) X = K_cross using eigendecomposition
+    print(f"  Solving linear system ({k_A}×{k_A}) via eigendecomposition...")
+    K_reg = K.clone()
+    K_reg.diagonal().add_(k_A * lamb)
+
+    eigenvalues, eigenvectors = torch.linalg.eigh(K_reg)
+    inv_eigenvalues = 1.0 / eigenvalues
+    X = eigenvectors @ (inv_eigenvalues.unsqueeze(1) * (eigenvectors.T @ K_cross))
+
+    # Scores = (1/λ)(K_cross - K @ X)
+    return (1.0 / lamb) * (K_cross - K @ X)
+
+
+def _compute_scores_direct(
+    train_grad_cache: GradientCache,
+    test_grad_cache: GradientCache,
+    projector,
+    lamb: float,
+    device: str,
+    batch_size: int,
+) -> torch.Tensor:
+    """Compute sketched scores using direct m×m PFP^T method."""
+    n_train = train_grad_cache.n_samples
+    n_test = test_grad_cache.n_samples
+    m = projector.proj_dim
+    dtype = train_grad_cache.dtype
+
+    # Pass 1: Build H = (1/n) Σ (Pg)(Pg)^T + λI
+    print(f"    Building projected Fisher matrix ({m}×{m})...")
+    H = torch.zeros(m, m, device=device, dtype=dtype)
+
+    for i_start in tqdm(range(0, n_train, batch_size), desc="    Pass 1: Building H", leave=False):
+        i_end = min(i_start + batch_size, n_train)
+        g_batch = train_grad_cache.get_batch(i_start, i_end, device=device)
+        pg_batch = projector.project(g_batch, ensemble_id=0)
+        H.add_(pg_batch.T @ pg_batch)
+
+    H.div_(n_train)
+    H.diagonal().add_(lamb)
+
+    # Eigendecomposition of regularized Fisher for numerical stability
+    print(f"    Computing eigendecomposition of H ({m}×{m})...")
+    eigenvalues, eigenvectors = torch.linalg.eigh(H)
+    inv_eigenvalues = 1.0 / eigenvalues
+
+    # Pre-compute Q_test = H^{-1} @ (P G_test)^T
+    print(f"    Computing test scores...")
+    Q_test = torch.zeros(m, n_test, device=device, dtype=dtype)
+
+    for j_start in tqdm(range(0, n_test, batch_size), desc="    Projecting test grads", leave=False):
+        j_end = min(j_start + batch_size, n_test)
+        g_batch = test_grad_cache.get_batch(j_start, j_end, device=device)
+        pg_batch = projector.project(g_batch, ensemble_id=0)
+        Q_test[:, j_start:j_end] = eigenvectors @ (inv_eigenvalues.unsqueeze(1) * (eigenvectors.T @ pg_batch.T))
+
+    # Pass 2: Stream train gradients to compute scores
+    print(f"    Computing final scores...")
+    scores = torch.zeros(n_train, n_test, device=device, dtype=dtype)
+
+    for i_start in tqdm(range(0, n_train, batch_size), desc="    Pass 2: Computing scores", leave=False):
+        i_end = min(i_start + batch_size, n_train)
+        g_batch = train_grad_cache.get_batch(i_start, i_end, device=device)
+        pg_batch = projector.project(g_batch, ensemble_id=0)
+        scores[i_start:i_end, :] = pg_batch @ Q_test
+
+    return scores
 
 
 def get_validation_split_indices(test_sampler, val_ratio=0.1, seed=0):
@@ -83,54 +229,14 @@ def get_validation_split_indices(test_sampler, val_ratio=0.1, seed=0):
     return val_indices, new_test_indices
 
 
-def create_validation_split(test_dataset, test_sampler, groundtruth, val_ratio=0.1, seed=0):
-    """Split test set into validation and test sets."""
-    test_indices = list(test_sampler)
-    num_test = len(test_indices)
-
-    np.random.seed(seed)
-    np.random.shuffle(test_indices)
-    num_val = int(val_ratio * num_test)
-    val_indices = test_indices[:num_val]
-    new_test_indices = test_indices[num_val:]
-
-    val_sampler = SubsetSampler(val_indices)
-    new_test_sampler = SubsetSampler(new_test_indices)
-
-    val_dataloader = torch.utils.data.DataLoader(
-        test_dataset, batch_size=64, sampler=val_sampler,
-    )
-    new_test_dataloader = torch.utils.data.DataLoader(
-        test_dataset, batch_size=64, sampler=new_test_sampler,
-    )
-
-    original_gt_values, subset_indices = groundtruth
-    test_indices_dict = {idx: pos for pos, idx in enumerate(test_sampler)}
-
-    val_gt_indices = [test_indices_dict[idx] for idx in val_indices]
-    val_gt_values = original_gt_values[:, val_gt_indices]
-    test_gt_indices = [test_indices_dict[idx] for idx in new_test_indices]
-    test_gt_values = original_gt_values[:, test_gt_indices]
-
-    return (
-        val_dataloader, new_test_dataloader,
-        (val_gt_values, subset_indices), (test_gt_values, subset_indices)
-    )
-
-
-def _get_gradient_info(gradients: GradientCache) -> Tuple[int, int, torch.dtype]:
+def _get_gradient_info(grad_cache: GradientCache) -> Tuple[int, int, torch.dtype]:
     """Get n_samples, dim, dtype from GradientCache."""
-    return gradients.n_samples, gradients.dim, gradients.dtype
-
-
-def _get_gradient_batch(gradients: GradientCache, start: int, end: int, device: str) -> torch.Tensor:
-    """Get a batch of gradients from cache."""
-    return gradients.get_batch(start, end, device=device)
+    return grad_cache.n_samples, grad_cache.dim, grad_cache.dtype
 
 
 def influence_function(
-    train_gradients: GradientCache,
-    test_gradients: GradientCache,
+    train_grad_cache: GradientCache,
+    test_grad_cache: GradientCache,
     lamb: float,
     proj_dim: int,
     proj_type: str = "normal",
@@ -139,25 +245,17 @@ def influence_function(
     batch_size: int = 64,
 ) -> torch.Tensor:
     """
-    Memory-Optimized IF Attribution using "Double Streaming" strategy.
+    Compute sketched influence scores using random projection.
 
-    Computes: score[i,j] = g_test[j]^T (F + λI)^{-1} g_train[i]
-    Using sketched approximation: g_test[j]^T P^T (PFP^T + λI)^{-1} P g_train[i]
+    Computes: score[i,j] = (Pg_train[i])^T (PFP^T + λI)^{-1} (Pg_test[j])
 
-    Strategy:
-    1. Stream gradients to form the operator matrix (H or K) block-by-block.
-    2. Invert the small operator matrix.
-    3. Stream gradients again to compute scores against the inverted operator.
-
-    Never stores the full (n_train × proj_dim) projection matrix.
-
-    Adaptive switching based on bottleneck:
-    - If m < n: Form m×m projected Fisher (PFP^T) - "Projected Fisher Method"
-    - If n < m: Form n×n kernel (K) - "Kernel Method" via Woodbury identity
+    Auto-selects optimal method based on dimensions:
+    - Woodbury (n×n kernel) when n_train < proj_dim
+    - Direct (m×m PFP^T) when proj_dim ≤ n_train
 
     Args:
-        train_gradients: Training gradients stored in GradientCache
-        test_gradients: Test gradients stored in GradientCache
+        train_grad_cache: Training gradients stored in GradientCache
+        test_grad_cache: Test gradients stored in GradientCache
         lamb: Regularization parameter λ
         proj_dim: Projection dimension m
         proj_type: Type of random projection ("normal", "rademacher", "sjlt")
@@ -168,13 +266,9 @@ def influence_function(
     Returns:
         Attribution scores of shape (n_train, n_test)
     """
-    n_train, d, dtype = _get_gradient_info(train_gradients)
-    n_test, _, _ = _get_gradient_info(test_gradients)
+    _, d, dtype = _get_gradient_info(train_grad_cache)
 
-    # Heuristic: Work in whichever dimension is smaller (m or n)
-    use_kernel_method = n_train < proj_dim
-
-    # Setup Projector
+    # Setup projector
     proj_type_enum = ProjectionType(proj_type)
     proj_bs = min(batch_size, 32)
     proj_bs = max(8, (proj_bs // 8) * 8)
@@ -190,173 +284,21 @@ def influence_function(
         dtype=dtype,
     )
 
-    scores = torch.zeros(n_train, n_test, device=device, dtype=dtype)
-
-    if use_kernel_method:
-        # === STRATEGY A: Kernel Method (Woodbury) ===
-        # Efficient when n_train is small (e.g., 500-5000) and proj_dim is large
-        # Form K = (PG)(PG)^T by projecting all gradients once and storing on CPU.
-        #
-        # Math: Using Woodbury identity on (PFP^T + λI)^{-1}
-        # Final scores = (1/λ)(K_cross - K @ M^{-1} @ K_cross)
-        # where K = PG @ PG^T (n×n), M = nλI + K, K_cross = PG @ PH^T
-
-        print(f"  Using Kernel Method (n={n_train} < m={proj_dim})...")
-
-        # 1. Project ALL training gradients once and store on CPU
-        # Memory: n_train × proj_dim × 4 bytes (e.g., 5000 × 32768 × 4 = 655 MB)
-        pg_train_mem_mb = n_train * proj_dim * 4 / (1024**2)
-        print(f"    Projecting {n_train} train gradients (will use ~{pg_train_mem_mb:.0f} MB CPU RAM)...")
-
-        PG_train_cpu = torch.zeros(n_train, proj_dim, dtype=dtype, device="cpu")
-        for i in tqdm(range(0, n_train, batch_size), desc="    Projecting train grads", leave=False):
-            i_end = min(i + batch_size, n_train)
-            g_batch = _get_gradient_batch(train_gradients, i, i_end, device)
-            pg_batch = projector.project(g_batch, ensemble_id=0)
-            PG_train_cpu[i:i_end] = pg_batch.cpu()
-            del g_batch, pg_batch
-            clear_memory(device)
-
-        # 2. Project test gradients and store on CPU
-        print(f"    Projecting {n_test} test gradients...")
-        PG_test_cpu = torch.zeros(n_test, proj_dim, dtype=dtype, device="cpu")
-        for j in tqdm(range(0, n_test, batch_size), desc="    Projecting test grads", leave=False):
-            j_end = min(j + batch_size, n_test)
-            g_batch = _get_gradient_batch(test_gradients, j, j_end, device)
-            pg_batch = projector.project(g_batch, ensemble_id=0)
-            PG_test_cpu[j:j_end] = pg_batch.cpu()
-            del g_batch, pg_batch
-            clear_memory(device)
-
-        # 3. Compute kernel matrices on GPU in batched fashion
-        print(f"    Computing kernel matrix ({n_train}x{n_train})...")
-        K = torch.zeros(n_train, n_train, device=device, dtype=dtype)
-        K_cross = torch.zeros(n_train, n_test, device=device, dtype=dtype)
-
-        # Process in row batches to limit GPU memory usage
-        kernel_batch_size = min(batch_size * 4, n_train)  # Larger batches for efficiency
-        for i in tqdm(range(0, n_train, kernel_batch_size), desc="    Building kernel", leave=False):
-            i_end = min(i + kernel_batch_size, n_train)
-            pg_i = PG_train_cpu[i:i_end].to(device)
-
-            # K_cross: (batch, m) @ (m, n_test) -> (batch, n_test)
-            PG_test_gpu = PG_test_cpu.to(device)
-            K_cross[i:i_end] = pg_i @ PG_test_gpu.T
-            del PG_test_gpu
-
-            # K: compute full row strip at once (batch, m) @ (n_train, m)^T -> (batch, n_train)
-            # Process in column batches to avoid OOM
-            for j in range(0, n_train, kernel_batch_size):
-                j_end = min(j + kernel_batch_size, n_train)
-                pg_j = PG_train_cpu[j:j_end].to(device)
-                K[i:i_end, j:j_end] = pg_i @ pg_j.T
-                del pg_j
-
-            del pg_i
-            clear_memory(device)
-
-        del PG_train_cpu, PG_test_cpu
-
-        # 4. Solve: M = K + nλI, then x = M^{-1} @ K_cross using eigendecomposition
-        print(f"    Solving linear system ({n_train}x{n_train}) via eigendecomposition...")
-        K.diagonal().add_(n_train * lamb)
-
-        # Use eigendecomposition for numerical stability with small λ
-        eigenvalues, eigenvectors = torch.linalg.eigh(K)
-        inv_eigenvalues = 1.0 / eigenvalues
-        # x = V @ diag(1/λ) @ V^T @ K_cross
-        x = eigenvectors @ (inv_eigenvalues.unsqueeze(1) * (eigenvectors.T @ K_cross))
-        del eigenvalues, inv_eigenvalues
-
-        # Restore K (remove regularization for final computation)
-        K.diagonal().add_(-n_train * lamb)
-
-        # Score = (1/λ) * (K_cross - K @ x)
-        scores = (1.0 / lamb) * (K_cross - K @ x)
-        print(f"    Done.")
-
-        del K, K_cross, eigenvectors, x
-
-    else:
-        # === STRATEGY B: Direct Projected Fisher (Standard Sketching) ===
-        # Efficient when m is small (e.g., 4096) and n is large (e.g., 50k)
-        # Form H = PFP^T (m × m) by streaming. Never stores (n × m) matrix.
-        #
-        # Pass 1: Stream gradients → Project → Accumulate H = (1/n)∑(Pg)(Pg)^T
-        # Pass 2: Stream gradients → Project → Multiply with H^{-1} → Final Score
-
-        print(f"  Using Projected Fisher Method (m={proj_dim} <= n={n_train})...")
-
-        # Pass 1: Accumulate H = (1/n) * sum((Pg)(Pg)^T)
-        print(f"    Building projected Fisher matrix ({proj_dim}x{proj_dim})...")
-        H = torch.zeros(proj_dim, proj_dim, device=device, dtype=dtype)
-
-        for i in tqdm(range(0, n_train, batch_size), desc="    Pass 1: Building H", leave=False):
-            i_end = min(i + batch_size, n_train)
-            g_batch = _get_gradient_batch(train_gradients, i, i_end, device)
-            pg_batch = projector.project(g_batch, ensemble_id=0)
-            del g_batch
-
-            # H += pg^T @ pg
-            H.add_(pg_batch.T @ pg_batch)
-            del pg_batch
-            clear_memory(device)
-
-        H.div_(n_train)
-        H.diagonal().add_(lamb)
-
-        # Eigendecomposition of regularized Fisher for numerical stability
-        print(f"    Computing eigendecomposition of H ({proj_dim}x{proj_dim})...")
-        eigenvalues, eigenvectors = torch.linalg.eigh(H)
-        inv_eigenvalues = 1.0 / eigenvalues
-        del H, eigenvalues
-
-        # Pre-compute Q_test = H^{-1} @ (P G_test)^T
-        # Size: (m, n_test) - acceptable since m is small in this branch
-        print(f"    Computing test scores...")
-        Q_test = torch.zeros(proj_dim, n_test, device=device, dtype=dtype)
-        for j in tqdm(range(0, n_test, batch_size), desc="    Projecting test grads", leave=False):
-            j_end = min(j + batch_size, n_test)
-            g_batch = _get_gradient_batch(test_gradients, j, j_end, device)
-            pg_batch = projector.project(g_batch, ensemble_id=0)  # (batch, m)
-            del g_batch
-
-            # Solve H * q = pg_batch^T using eigendecomposition
-            # q = V @ diag(1/λ) @ V^T @ pg_batch^T
-            Q_test[:, j:j_end] = eigenvectors @ (inv_eigenvalues.unsqueeze(1) * (eigenvectors.T @ pg_batch.T))
-            del pg_batch
-            clear_memory(device)
-
-        del eigenvectors, inv_eigenvalues
-
-        # Pass 2: Stream Train Gradients AGAIN to compute scores
-        # Score_i = (P g_i)^T @ Q_test = (P g_i) @ (H^{-1} @ P G_test^T)
-        print(f"    Computing final scores...")
-        for i in tqdm(range(0, n_train, batch_size), desc="    Pass 2: Computing scores", leave=False):
-            i_end = min(i + batch_size, n_train)
-            g_batch = _get_gradient_batch(train_gradients, i, i_end, device)
-            pg_batch = projector.project(g_batch, ensemble_id=0)  # (batch, m)
-            del g_batch
-
-            # (batch, m) @ (m, n_test) -> (batch, n_test)
-            scores[i:i_end, :] = pg_batch @ Q_test
-            del pg_batch
-            clear_memory(device)
-
-        print(f"    Done.")
-        del Q_test
+    # Compute scores using unified API (auto-selects optimal method)
+    scores = compute_scores_sketched(
+        train_grad_cache, test_grad_cache, projector, lamb, device, batch_size
+    )
 
     if hasattr(projector, 'free_memory'):
         projector.free_memory()
-    clear_memory(device)
 
     return scores
 
 
 def run_lambda_sweep(
-    train_gradients: GradientCache,
-    val_gradients: GradientCache,
-    test_gradients: GradientCache,
+    train_grad_cache: GradientCache,
+    val_grad_cache: GradientCache,
+    test_grad_cache: GradientCache,
     val_gt: tuple,
     test_gt: tuple,
     proj_dim: int,
@@ -380,9 +322,9 @@ def run_lambda_sweep(
     This reduces complexity from O(num_λ × n × d) to O(n × d + num_λ × n²).
 
     Args:
-        train_gradients: Training gradient cache (required)
-        val_gradients: Validation gradient cache (required)
-        test_gradients: Test gradient cache (required)
+        train_grad_cache: Training gradient cache (required)
+        val_grad_cache: Validation gradient cache (required)
+        test_grad_cache: Test gradient cache (required)
         val_gt: Validation ground truth for LDS computation
         test_gt: Test ground truth for LDS computation
         proj_dim: Projection dimension m (fixed)
@@ -395,9 +337,9 @@ def run_lambda_sweep(
     Returns:
         Dictionary with sweep results
     """
-    n_train, d, dtype = _get_gradient_info(train_gradients)
-    n_val, _, _ = _get_gradient_info(val_gradients)
-    n_test, _, _ = _get_gradient_info(test_gradients)
+    n_train, d, dtype = _get_gradient_info(train_grad_cache)
+    n_val, _, _ = _get_gradient_info(val_grad_cache)
+    n_test, _, _ = _get_gradient_info(test_grad_cache)
 
     results = {"lambda_values": [], "val_lds": [], "proj_dim": proj_dim}
 
@@ -424,33 +366,27 @@ def run_lambda_sweep(
     PG_train = torch.zeros(n_train, proj_dim, dtype=dtype, device="cpu")
     for i in tqdm(range(0, n_train, batch_size), desc="    Train", leave=False):
         i_end = min(i + batch_size, n_train)
-        g_batch = train_gradients.get_batch(i, i_end, device=device)
+        g_batch = train_grad_cache.get_batch(i, i_end, device=device)
         pg_batch = projector.project(g_batch, ensemble_id=0)
         PG_train[i:i_end] = pg_batch.cpu()
-        del g_batch, pg_batch
-    clear_memory(device)
 
     print(f"  [2/4] Projecting {n_val} val + {n_test} test gradients...")
     PG_val = torch.zeros(n_val, proj_dim, dtype=dtype, device="cpu")
     for i in tqdm(range(0, n_val, batch_size), desc="    Val", leave=False):
         i_end = min(i + batch_size, n_val)
-        g_batch = val_gradients.get_batch(i, i_end, device=device)
+        g_batch = val_grad_cache.get_batch(i, i_end, device=device)
         pg_batch = projector.project(g_batch, ensemble_id=0)
         PG_val[i:i_end] = pg_batch.cpu()
-        del g_batch, pg_batch
 
     PG_test = torch.zeros(n_test, proj_dim, dtype=dtype, device="cpu")
     for i in tqdm(range(0, n_test, batch_size), desc="    Test", leave=False):
         i_end = min(i + batch_size, n_test)
-        g_batch = test_gradients.get_batch(i, i_end, device=device)
+        g_batch = test_grad_cache.get_batch(i, i_end, device=device)
         pg_batch = projector.project(g_batch, ensemble_id=0)
         PG_test[i:i_end] = pg_batch.cpu()
-        del g_batch, pg_batch
 
     if hasattr(projector, 'free_memory'):
         projector.free_memory()
-    del projector
-    clear_memory(device)
 
     # =========================================================================
     # Step 2: Compute kernel matrices (on GPU in blocks if needed)
@@ -464,14 +400,10 @@ def run_lambda_sweep(
     # K_val_cross = PG_val @ PG_train^T (n_val × n_train)
     PG_val_gpu = PG_val.to(device)
     K_val_cross = PG_val_gpu @ PG_train_gpu.T
-    del PG_val_gpu, PG_val
 
     # K_test_cross = PG_test @ PG_train^T (n_test × n_train)
     PG_test_gpu = PG_test.to(device)
     K_test_cross = PG_test_gpu @ PG_train_gpu.T
-    del PG_test_gpu, PG_test, PG_train_gpu, PG_train
-
-    clear_memory(device)
 
     # =========================================================================
     # Step 3: Eigendecompose K_train ONCE
@@ -485,9 +417,6 @@ def run_lambda_sweep(
     # Precompute U^T @ K_cross^T for fast score computation
     UT_Kval_T = U.T @ K_val_cross.T  # (n_train, n_val)
     UT_Ktest_T = U.T @ K_test_cross.T  # (n_train, n_test)
-
-    del K_train  # No longer needed after eigendecomp
-    clear_memory(device)
 
     # =========================================================================
     # Step 4: Fast λ sweep (milliseconds per λ!)
@@ -520,8 +449,6 @@ def run_lambda_sweep(
 
         print(f"    λ = {lamb:.1e}: Val LDS = {mean_val_lds:.4f}")
 
-        del val_scores_T, val_lds_score
-
     # Evaluate best λ on test set
     n_lamb = n_train * best_lambda
     inv_diag = 1.0 / (eigenvalues + n_lamb)
@@ -536,16 +463,12 @@ def run_lambda_sweep(
 
     print(f"\n  Best λ = {best_lambda:.1e}: Val LDS = {best_val_lds:.4f}, Test LDS = {mean_test_lds:.4f}")
 
-    del eigenvalues, U, UT_Kval_T, UT_Ktest_T, K_val_cross, K_test_cross
-    del test_scores_T, test_lds_score
-    clear_memory(device)
-
     return results
 
 
 def run_m_sweep(
-    train_gradients: GradientCache,
-    val_gradients: GradientCache,
+    train_grad_cache: GradientCache,
+    val_grad_cache: GradientCache,
     val_gt: tuple,
     lamb: float,
     m_values: List[int],
@@ -561,8 +484,8 @@ def run_m_sweep(
     LDS should stabilize once m ≥ d_λ/ε² for desired ε.
 
     Args:
-        train_gradients: Training gradient cache (required)
-        val_gradients: Validation gradient cache (required)
+        train_grad_cache: Training gradient cache (required)
+        val_grad_cache: Validation gradient cache (required)
         val_gt: Validation ground truth for LDS computation
         lamb: Fixed regularization parameter λ
         m_values: List of projection dimensions to sweep
@@ -579,8 +502,8 @@ def run_m_sweep(
     for proj_dim in tqdm(m_values, desc=f"m sweep (λ={lamb:.1e})"):
         # Compute attribution scores using influence functions
         val_score = influence_function(
-            train_gradients=train_gradients,
-            test_gradients=val_gradients,
+            train_grad_cache=train_grad_cache,
+            test_grad_cache=val_grad_cache,
             lamb=lamb,
             proj_dim=proj_dim,
             proj_type=proj_type,
@@ -597,10 +520,6 @@ def run_m_sweep(
 
         print(f"  m = {proj_dim}: Val LDS = {mean_val_lds:.4f}")
 
-        # Memory cleanup
-        del val_score, val_lds_score
-        clear_memory(device)
-
     return results
 
 
@@ -609,7 +528,6 @@ def effective_dimension(
     gradients: GradientCache,
     device: str = "cuda",
     batch_size: int = 32,
-    eigenvalues: Optional[torch.Tensor] = None,
 ) -> Dict:
     """
     Compute effective dimension d_λ for the model.
@@ -625,26 +543,18 @@ def effective_dimension(
         gradients: Pre-computed gradient cache (required)
         device: Device for computation
         batch_size: Batch size for Gram matrix computation
-        eigenvalues: Pre-computed eigenvalues (optional, will compute if None)
 
     Returns:
         Dictionary mapping λ -> d_λ
     """
-    # Compute eigenvalues once (O(n²d) for Gram + O(n³) for eigendecomp)
-    # Use larger batch size for Gram matrix computation (less memory-intensive than gradients)
-    if eigenvalues is None:
-        print("  Computing eigenvalues of Gram matrix...")
-        gram_batch_size = batch_size * 4  # Gram computation can handle larger batches
-        eigenvalues = compute_eigenvalues(gradients, device=device, batch_size=gram_batch_size)
+    print("  Computing eigenvalues of Gram matrix...")
+    gram_batch_size = batch_size * 4  # Gram computation can handle larger batches
+    _, d_lambda_dict = compute_eigenspectrum(
+        gradients, lambda_values, device=device, batch_size=gram_batch_size
+    )
 
-    # Compute d_λ analytically for each λ (O(n) per λ - instant!)
-    d_lambda_dict = {}
     for lamb in lambda_values:
-        d_lambda = compute_effective_dimension(eigenvalues, lamb)
-        d_lambda_dict[lamb] = d_lambda
-        print(f"  λ = {lamb:.1e}: d_λ = {d_lambda:.1f}")
-
-    clear_memory(device)
+        print(f"  λ = {lamb:.1e}: d_λ = {d_lambda_dict[lamb]:.1f}")
 
     return d_lambda_dict
 
@@ -733,7 +643,7 @@ def run_full_comparison(
 
     # Compute training gradients
     print("  Computing training gradients...")
-    train_gradients = create_gradient_cache(
+    train_grad_cache = create_gradient_cache(
         model=model,
         dataset=model_details["train_dataset"],
         indices=train_indices,
@@ -746,7 +656,7 @@ def run_full_comparison(
 
     # Compute validation gradients
     print("  Computing validation gradients...")
-    val_gradients = create_gradient_cache(
+    val_grad_cache = create_gradient_cache(
         model=model,
         dataset=model_details["test_dataset"],
         indices=val_indices,
@@ -759,7 +669,7 @@ def run_full_comparison(
 
     # Compute test gradients
     print("  Computing test gradients...")
-    test_gradients = create_gradient_cache(
+    test_grad_cache = create_gradient_cache(
         model=model,
         dataset=model_details["test_dataset"],
         indices=test_indices,
@@ -770,8 +680,8 @@ def run_full_comparison(
         cache_dir=f"{cache_dir}/test" if cache_dir else None,
     )
 
-    print(f"  Gradient caches ready: train={train_gradients.n_samples}, "
-          f"val={val_gradients.n_samples}, test={test_gradients.n_samples}")
+    print(f"  Gradient caches ready: train={train_grad_cache.n_samples}, "
+          f"val={val_grad_cache.n_samples}, test={test_grad_cache.n_samples}")
 
     # =========================================================================
     # Step 1: Compute effective dimensions
@@ -779,12 +689,11 @@ def run_full_comparison(
     print("\n[Step 1] Computing effective dimensions d_λ(F)...")
     d_lambda_dict = effective_dimension(
         lambda_values=lambda_values,
-        gradients=train_gradients,
+        gradients=train_grad_cache,
         device=device,
         batch_size=batch_size,
     )
     results["d_lambda"] = d_lambda_dict
-    clear_memory(device)
 
     print("\nEffective dimensions:")
     for lamb, d_l in d_lambda_dict.items():
@@ -798,9 +707,9 @@ def run_full_comparison(
     print("\n[Step 2] Sweeping λ with fixed large m...")
     large_m = max(m_values)
     lambda_sweep_results = run_lambda_sweep(
-        train_gradients=train_gradients,
-        val_gradients=val_gradients,
-        test_gradients=test_gradients,
+        train_grad_cache=train_grad_cache,
+        val_grad_cache=val_grad_cache,
+        test_grad_cache=test_grad_cache,
         val_gt=val_gt,
         test_gt=test_gt,
         proj_dim=large_m,
@@ -812,7 +721,6 @@ def run_full_comparison(
     )
 
     results["lambda_sweep"] = lambda_sweep_results
-    clear_memory(device)
 
     best_lambda = lambda_sweep_results["best_lambda"]
     best_d_lambda = d_lambda_dict.get(best_lambda, d_lambda_dict[min(d_lambda_dict.keys(), key=lambda x: abs(x - best_lambda))])
@@ -828,8 +736,8 @@ def run_full_comparison(
     # =========================================================================
     print(f"\n[Step 3] Sweeping m with fixed λ* = {best_lambda:.1e}...")
     m_sweep_results = run_m_sweep(
-        train_gradients=train_gradients,
-        val_gradients=val_gradients,
+        train_grad_cache=train_grad_cache,
+        val_grad_cache=val_grad_cache,
         val_gt=val_gt,
         lamb=best_lambda,
         m_values=m_values,
@@ -839,12 +747,6 @@ def run_full_comparison(
         batch_size=batch_size,
     )
     results["m_sweep"] = m_sweep_results
-
-    # =========================================================================
-    # Cleanup and final analysis
-    # =========================================================================
-    del train_gradients, val_gradients, test_gradients
-    clear_memory(device)
 
     # Find minimum m that achieves ~95% of max LDS
     max_lds = max(m_sweep_results["val_lds"])
@@ -917,8 +819,8 @@ def main():
     print("="*60 + "\n")
 
     # Define search spaces
-    lambda_values = [1e-9, 1e-8, 1e-7, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1e0, 1e1, 1e2, 1e3, 1e4]
-    m_values = [32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576, 2097152]
+    lambda_values = [1e-4, 1e-3, 1e-2, 1e-1, 1e0, 1e1, 1e2, 1e3]
+    m_values = [32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576]
 
     # Save results with organized directory structure
     experiment_dir = os.path.join(args.output_dir, "hyperparam_selection")
@@ -963,19 +865,19 @@ def main():
 
         # Compute gradients
         print("Computing gradient caches...")
-        train_gradients = create_gradient_cache(
+        train_grad_cache = create_gradient_cache(
             model=model, dataset=model_details["train_dataset"], indices=train_indices,
             device=args.device, offload=args.offload, model_type=model_type,
             batch_size=args.batch_size,
             cache_dir=f"{args.cache_dir}/train" if args.cache_dir else None,
         )
-        val_gradients = create_gradient_cache(
+        val_grad_cache = create_gradient_cache(
             model=model, dataset=model_details["test_dataset"], indices=val_indices,
             device=args.device, offload=args.offload, model_type=model_type,
             batch_size=args.batch_size,
             cache_dir=f"{args.cache_dir}/val" if args.cache_dir else None,
         )
-        test_gradients = create_gradient_cache(
+        test_grad_cache = create_gradient_cache(
             model=model, dataset=model_details["test_dataset"], indices=test_indices,
             device=args.device, offload=args.offload, model_type=model_type,
             batch_size=args.batch_size,
@@ -983,9 +885,9 @@ def main():
         )
 
         results = run_lambda_sweep(
-            train_gradients=train_gradients,
-            val_gradients=val_gradients,
-            test_gradients=test_gradients,
+            train_grad_cache=train_grad_cache,
+            val_grad_cache=val_grad_cache,
+            test_grad_cache=test_grad_cache,
             val_gt=val_gt,
             test_gt=test_gt,
             proj_dim=args.proj_dim,
@@ -995,9 +897,6 @@ def main():
             seed=args.seed,
             batch_size=args.batch_size,
         )
-
-        del train_gradients, val_gradients, test_gradients
-        clear_memory(args.device)
 
         results_filename = f"{args.dataset}_{args.model}_lambda_sweep_m{args.proj_dim}.pt"
         results_path = os.path.join(experiment_dir, results_filename)
@@ -1025,13 +924,13 @@ def main():
 
         # Compute gradients
         print("Computing gradient caches...")
-        train_gradients = create_gradient_cache(
+        train_grad_cache = create_gradient_cache(
             model=model, dataset=model_details["train_dataset"], indices=train_indices,
             device=args.device, offload=args.offload, model_type=model_type,
             batch_size=args.batch_size,
             cache_dir=f"{args.cache_dir}/train" if args.cache_dir else None,
         )
-        val_gradients = create_gradient_cache(
+        val_grad_cache = create_gradient_cache(
             model=model, dataset=model_details["test_dataset"], indices=val_indices,
             device=args.device, offload=args.offload, model_type=model_type,
             batch_size=args.batch_size,
@@ -1039,8 +938,8 @@ def main():
         )
 
         results = run_m_sweep(
-            train_gradients=train_gradients,
-            val_gradients=val_gradients,
+            train_grad_cache=train_grad_cache,
+            val_grad_cache=val_grad_cache,
             val_gt=val_gt,
             lamb=args.lamb,
             m_values=m_values,
@@ -1049,9 +948,6 @@ def main():
             seed=args.seed,
             batch_size=args.batch_size,
         )
-
-        del train_gradients, val_gradients
-        clear_memory(args.device)
 
         results_filename = f"{args.dataset}_{args.model}_m_sweep_lamb{args.lamb}.pt"
         results_path = os.path.join(experiment_dir, results_filename)

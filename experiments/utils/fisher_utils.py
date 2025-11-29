@@ -1,168 +1,23 @@
 """
 Fisher Information Matrix utilities for theoretical validation experiments.
-
-This module provides memory-efficient functions to compute:
-- Per-sample gradients using vmap (vectorized map)
-- Eigenvalues of the empirical Fisher Information Matrix (eFIM)
-- Effective dimension d_λ(F)
-- Sandwich bounds for sketched inverses
-- Hutchinson trace estimator for scalable d_λ estimation
-
-Key insight: For n samples with d parameters, we always use the Gram matrix
-G @ G^T / n (n×n) instead of Fisher F = G^T @ G / n (d×d) when n < d,
-since they share the same nonzero eigenvalues. This is critical because
-typically n << d in neural networks.
 """
 
 from __future__ import annotations
-from typing import Optional, Tuple, Union, Any, TYPE_CHECKING
-import gc
+from typing import Optional, Union, Any, Tuple, TYPE_CHECKING
 import math
 import torch
-import torch.nn as nn
 from torch import Tensor
-from torch.func import grad, vmap, functional_call
-from tqdm import tqdm
 
-# Import GradientCache for explicit type checking (avoids circular import at runtime)
 if TYPE_CHECKING:
     from .gradient_cache import GradientCache
 
 
 # =============================================================================
-# Memory Management Utilities
+# Gram Matrix Computation
 # =============================================================================
 
-def clear_memory(device: str = "cuda"):
-    """Explicitly clear GPU and CPU memory."""
-    gc.collect()
-    if device == "cuda" and torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
-
-
-# =============================================================================
-# Gradient Computation (vmap-based)
-# =============================================================================
-
-def compute_per_sample_gradients(
-    model: nn.Module,
-    dataset: torch.utils.data.Dataset,
-    indices: list[int],
-    device: str = "cuda",
-    batch_size: int = 32,
-    model_type: str = "default",
-) -> list[Tensor]:
-    """
-    Compute per-sample gradients using vmap for efficiency.
-
-    Uses torch.func's vmap(grad(...)) approach which is significantly faster
-    than computing gradients one sample at a time with backward().
-
-    Args:
-        model: The neural network model
-        dataset: Dataset containing training samples
-        indices: List of sample indices to compute gradients for
-        device: Device for computation
-        batch_size: Batch size for vmap gradient computation
-        model_type: "musictransformer" for sequence models, "default" for image classification
-
-    Returns:
-        List of gradient tensors on CPU, each of shape (d,)
-    """
-    model = model.to(device)
-    model.eval()
-
-    # Get named parameters for functional_call
-    params = {k: p for k, p in model.named_parameters() if p.requires_grad}
-    d_params = sum(p.numel() for p in params.values())
-
-    print(f"Computing gradients for {len(indices)} samples using vmap...")
-    print(f"Model has {d_params:,} parameters")
-    print(f"Batch size: {batch_size}")
-
-    # Define loss function in torch.func style
-    if model_type == "musictransformer":
-        def loss_func(params_dict, data):
-            input_seq, target_seq = data
-            input_seq = input_seq.unsqueeze(0)
-            output = functional_call(model, params_dict, (input_seq,))
-            output_flat = output.view(-1, output.size(-1))
-            target_flat = target_seq.view(-1)
-            return nn.CrossEntropyLoss()(output_flat, target_flat)
-    else:
-        def loss_func(params_dict, data):
-            image, label = data
-            image = image.unsqueeze(0)
-            output = functional_call(model, params_dict, (image,))
-            return nn.CrossEntropyLoss()(output.squeeze(0), label)
-
-    # Create vmap'd gradient function
-    grad_func = vmap(grad(loss_func), in_dims=(None, 0), randomness="different")
-
-    gradients_cpu = []
-
-    for batch_start in tqdm(range(0, len(indices), batch_size), desc="Computing gradients"):
-        batch_end = min(batch_start + batch_size, len(indices))
-        batch_indices = indices[batch_start:batch_end]
-
-        # Collate batch data
-        if model_type == "musictransformer":
-            inputs = torch.stack([dataset[idx][0] for idx in batch_indices]).to(device)
-            targets = torch.stack([dataset[idx][1] for idx in batch_indices]).to(device)
-            batch_data = (inputs, targets)
-        else:
-            images = torch.stack([dataset[idx][0] for idx in batch_indices]).to(device)
-            labels = torch.tensor([dataset[idx][1] for idx in batch_indices]).to(device)
-            batch_data = (images, labels)
-
-        # Compute per-sample gradients using vmap
-        with torch.no_grad():
-            grad_dict = grad_func(params, batch_data)
-
-        # Flatten and concatenate gradients for each sample
-        for i in range(len(batch_indices)):
-            grad_flat = torch.cat([
-                grad_dict[k][i].view(-1) for k in params.keys()
-            ])
-            gradients_cpu.append(grad_flat.cpu())
-
-        # Memory cleanup
-        del grad_dict, batch_data
-        if model_type == "musictransformer":
-            del inputs, targets
-        else:
-            del images, labels
-        clear_memory(device)
-
-    return gradients_cpu
-
-
-class _DiskBatchDataset(torch.utils.data.Dataset):
-    """
-    Dataset for loading gradient batches from disk files.
-
-    Designed for use with DataLoader's multiprocessing workers to parallelize
-    disk I/O. Only stores paths (picklable), not GradientCache object.
-    """
-
-    def __init__(self, cache_dir: str, n_batches: int):
-        self.cache_dir = cache_dir
-        self.n_batches = n_batches
-
-    def __len__(self) -> int:
-        return self.n_batches
-
-    def __getitem__(self, batch_idx: int) -> Tuple[int, Tensor]:
-        """Load a batch from disk. Called by DataLoader workers (separate processes)."""
-        from pathlib import Path
-        batch_file = Path(self.cache_dir) / f"batch_{batch_idx}.pt"
-        data = torch.load(batch_file, map_location="cpu", weights_only=True)
-        return batch_idx, data
-
-
-def compute_gram_matrix(
-    gradients: "GradientCache",
+def _compute_gram_matrix(
+    grad_cache: GradientCache,
     device: str = "cuda",
     batch_size: int = 128,
     projector: Optional[Any] = None,
@@ -170,17 +25,8 @@ def compute_gram_matrix(
     """
     Compute Gram matrix K = G @ G^T / n (or (PG) @ (PG)^T / n) via streaming.
 
-    Works with all GradientCache offload modes (none, cpu, disk).
-
-    Uses block-wise computation to minimize memory usage:
-    - Only loads O(batch_size) gradients at a time
-    - Exploits symmetry: only computes upper triangle
-    - Memory: O(batch_size * d) for gradients + O(n²) for result
-    - If projector provided: projects gradients immediately after loading,
-      so memory is O(batch_size * m) where m is projection dimension
-
     Args:
-        gradients: GradientCache object (any offload mode)
+        grad_cache: GradientCache object (any offload mode)
         device: Device for computation (default: "cuda")
         batch_size: Batch size for block computation
         projector: Optional dattri projector. If provided, computes
@@ -189,18 +35,15 @@ def compute_gram_matrix(
     Returns:
         K: Gram matrix (n, n) on the specified device, normalized by n
     """
-    n = gradients.n_samples
+    n = grad_cache.n_samples
     effective_batch_size = batch_size if batch_size else 100
     n_batches = math.ceil(n / effective_batch_size)
-
-    proj_desc = "Projected " if projector else ""
-    print(f"Computing {proj_desc}Gram matrix for {n} samples ({n_batches} batches, size={effective_batch_size})...")
 
     # Initialize output matrix
     K = torch.zeros(n, n, device=device)
 
     # Determine mode
-    use_disk_mode = gradients.offload == "disk"
+    use_disk_mode = grad_cache.offload == "disk"
     use_cuda = device == "cuda" and torch.cuda.is_available()
 
     def get_batch_range(batch_idx: int) -> Tuple[int, int]:
@@ -216,25 +59,10 @@ def compute_gram_matrix(
     # Helper to apply projection (if projector provided)
     def maybe_project(data_gpu):
         if projector is not None:
-            result = projector.project(data_gpu, ensemble_id=0)
-            # Synchronize to catch CUDA errors at their source rather than later
-            if use_cuda:
-                torch.cuda.synchronize()
-            return result
+            return projector.project(data_gpu, ensemble_id=0)
         return data_gpu
 
-    if use_disk_mode:
-        # =======================================================================
-        # Disk mode: Double-buffering with background disk prefetch
-        #
-        # Strategy:
-        # 1. Use ThreadPoolExecutor to load next batch from disk in background
-        # 2. Use CUDA streams to overlap CPU->GPU transfer with computation
-        # 3. LRU cache on CPU avoids repeated disk reads for same batch
-        #
-        # Timeline per inner iteration:
-        #   [Compute j] [Transfer j+1] [Disk load j+2 (background)]
-        # =======================================================================
+    if use_disk_mode: # Disk mode: Double-buffering with background disk prefetch
         from concurrent.futures import ThreadPoolExecutor
 
         disk_executor = ThreadPoolExecutor(max_workers=2)  # 2 workers for better overlap
@@ -242,9 +70,9 @@ def compute_gram_matrix(
         def load_to_cpu(batch_idx):
             """Load batch to CPU, using cache if available."""
             start, end = get_batch_range(batch_idx)
-            return gradients.get_batch(start, end, device="cpu")
+            return grad_cache.get_batch(start, end, device="cpu")
 
-        for i_batch in tqdm(range(n_batches), desc=f"Computing {proj_desc}Gram matrix"):
+        for i_batch in range(n_batches):
             i_start, i_end = get_batch_range(i_batch)
 
             # Load G_i and project immediately to reduce memory
@@ -304,23 +132,16 @@ def compute_gram_matrix(
                 # Fill symmetric block K[j,i] = K[i,j]^T
                 if i_batch != j_batch:
                     K[j_start:j_end, i_start:i_end] = block.T
-                    del G_j_gpu
-
-            del G_i_gpu
-
-            if i_batch % 5 == 0 and use_cuda:
-                torch.cuda.empty_cache()
 
         disk_executor.shutdown(wait=True)
-        gradients.clear_cache()
 
     else:
         # =======================================================================
         # CPU/none mode: Direct memory access (original efficient path)
         # =======================================================================
-        storage = gradients._memory_storage
+        storage = grad_cache._memory_storage
 
-        for i_batch in tqdm(range(n_batches), desc=f"Computing {proj_desc}Gram matrix"):
+        for i_batch in range(n_batches):
             i_start, i_end = get_batch_range(i_batch)
             G_i_cpu = storage[i_start:i_end]
 
@@ -362,561 +183,147 @@ def compute_gram_matrix(
                 if i_batch != j_batch:
                     K[j_start:j_end, i_start:i_end] = block.T
 
-                if j_batch != i_batch:
-                    del G_j_gpu
-
-            del G_i_gpu
-
-            if i_batch % 20 == 0 and use_cuda:
-                torch.cuda.empty_cache()
-
-    gc.collect()
-    clear_memory(device)
-
     return K / n
 
 
-def compute_cross_kernel(
-    grads_small: "GradientCache",
-    grads_large: "GradientCache",
+def compute_eigenspectrum(
+    grad_cache: GradientCache,
+    lambda_values: list,
     device: str = "cuda",
     batch_size: int = 128,
-    projector: Optional[Any] = None,
-) -> Tensor:
+    return_gram: bool = False,
+) -> Union[Tuple[Tensor, dict], Tuple[Tensor, dict, Tensor]]:
     """
-    Compute cross-kernel K_cross = G_small @ G_large^T / sqrt(n_small * n_large).
-
-    If projector provided, computes (P G_small) @ (P G_large)^T.
-
-    Memory-efficient: The small dataset (e.g., val/test) is loaded entirely into
-    GPU memory since it's typically small (100-1000 samples). The large dataset
-    (train) is streamed.
-
-    Args:
-        grads_small: GradientCache for small dataset (val/test) - loaded fully
-        grads_large: GradientCache for large dataset (train) - streamed
-        device: Device for computation
-        batch_size: Batch size for streaming the large dataset
-        projector: Optional projector. If provided, projects both before computing.
-
-    Returns:
-        K_cross: Shape (n_small, n_large), NOT normalized (raw dot products)
-    """
-    n_small = grads_small.n_samples
-    n_large = grads_large.n_samples
-    dtype = grads_small.dtype
-
-    proj_desc = "Projected " if projector else ""
-    print(f"  Computing {proj_desc}cross kernel ({n_small} x {n_large})...")
-
-    # Step 1: Load and project the small dataset entirely (val/test are small)
-    # Memory: n_small * m * 4 bytes. For n_small=1000, m=200k -> 800MB (fits)
-    print(f"    Loading and projecting {n_small} samples from small set...")
-    PG_small_chunks = []
-    for i in range(0, n_small, batch_size):
-        end = min(i + batch_size, n_small)
-        g_batch = grads_small.get_batch(i, end, device=device)
-        if projector is not None:
-            g_batch = projector.project(g_batch, ensemble_id=0)
-        PG_small_chunks.append(g_batch)
-    PG_small = torch.cat(PG_small_chunks, dim=0)  # (n_small, m or d)
-    del PG_small_chunks
-    clear_memory(device)
-
-    # Step 2: Stream the large dataset and compute K_cross
-    K_cross = torch.zeros(n_small, n_large, device=device, dtype=dtype)
-
-    n_batches = math.ceil(n_large / batch_size)
-    for i in tqdm(range(0, n_large, batch_size), desc=f"    Streaming large set", leave=False):
-        end = min(i + batch_size, n_large)
-        g_large_batch = grads_large.get_batch(i, end, device=device)
-        if projector is not None:
-            g_large_batch = projector.project(g_large_batch, ensemble_id=0)
-
-        # (n_small, m) @ (batch, m)^T -> (n_small, batch)
-        K_cross[:, i:end] = PG_small @ g_large_batch.T
-        del g_large_batch
-
-        if i % (batch_size * 10) == 0:
-            clear_memory(device)
-
-    del PG_small
-    clear_memory(device)
-
-    return K_cross
-
-
-def compute_eigenvalues(
-    gradients: "GradientCache",
-    device: str = "cuda",
-    batch_size: int = 128,
-) -> Tensor:
-    """
-    Compute eigenvalues of F = G^T @ G / n.
+    Compute eigenvalues of F = G^T @ G / n and effective dimensions for given λ values.
 
     Uses Gram matrix K = G @ G^T / n (n×n) since K and F share
     the same nonzero eigenvalues. This is efficient because typically n << d.
 
+    Effective dimension: d_λ(F) = tr(F(F + λI)^{-1}) = Σ_i λ_i / (λ_i + λ)
+
     Args:
-        gradients: GradientCache containing the gradients
+        grad_cache: GradientCache containing the gradients
+        lambda_values: List of regularization parameters λ to compute d_λ for
         device: Device for computation
         batch_size: Batch size for streaming
+        return_gram: If True, also return the Gram matrix K
 
     Returns:
         eigenvalues: Eigenvalues of F in descending order
+        effective_dims: Dictionary mapping λ -> d_λ
+        K (optional): Gram matrix if return_gram=True
     """
-    K = compute_gram_matrix(gradients, device, batch_size)
+    K = _compute_gram_matrix(grad_cache, device, batch_size)
     eigenvalues = torch.linalg.eigvalsh(K)
-    del K
-    clear_memory(device)
 
     eigenvalues = eigenvalues.flip(0)
-    return torch.clamp(eigenvalues, min=0)
-
-
-def compute_effective_dimension(eigenvalues: Tensor, lamb: float) -> float:
-    """
-    Compute effective dimension from eigenvalues.
-
-    d_λ(F) = tr(F(F + λI)^{-1}) = Σ_i λ_i / (λ_i + λ)
-
-    Args:
-        eigenvalues: Eigenvalues of F (from compute_eigenvalues)
-        lamb: Regularization parameter λ
-
-    Returns:
-        d_lambda: The effective dimension
-    """
     eigenvalues = torch.clamp(eigenvalues, min=0)
-    d_lambda = torch.sum(eigenvalues / (eigenvalues + lamb))
-    return d_lambda.item()
 
+    # Compute effective dimension for each lambda
+    effective_dims = {}
+    for lamb in lambda_values:
+        d_lambda = torch.sum(eigenvalues / (eigenvalues + lamb))
+        effective_dims[lamb] = d_lambda.item()
 
-def estimate_effective_dimension(
-    gradients: "GradientCache",
-    lamb: float,
-    device: str = "cuda",
-    num_probes: int = 100,
-    batch_size: int = 32,
-) -> Tuple[float, float]:
-    """
-    Estimate effective dimension using Hutchinson's trace estimator with Woodbury formula.
-
-    d_λ = tr(F(F + λI)^{-1}) ≈ E[z^T F (F + λI)^{-1} z] where z ~ N(0, I)
-
-    Uses the Woodbury identity to work in n-dimensional space (n = num samples)
-    instead of d-dimensional space (d = num parameters), which is much more efficient
-    when gradients are stored on CPU.
-
-    Key insight from proposal Section 4:
-        z^T F(F + λI)^{-1} z = u^T (λnI + K)^{-1} u, where u = G^T z and K = G^T G
-
-    This reduces the cost from O(num_probes * cg_iters * n * d) to O(n^2 * d + n^3 + num_probes * n * d).
-
-    Args:
-        gradients: GradientCache containing the gradients
-        lamb: Regularization parameter λ
-        device: GPU device for computation
-        num_probes: Number of random probe vectors
-        batch_size: Batch size for streaming operations
-
-    Returns:
-        Tuple of (estimated d_lambda, standard error)
-    """
-    n = gradients.n_samples
-    d = gradients.dim
-    dtype = gradients.dtype
-
-    # Step 1: Compute Gram matrix K = G^T G (n x n) via streaming
-    # This is the key: work in n-dimensional space, not d-dimensional
-    print(f"  Building Gram matrix K ({n}x{n}) for Woodbury formula...")
-    K = compute_gram_matrix(gradients, device=device, batch_size=batch_size)
-    # Note: compute_gram_matrix returns K/n, we need K = n * (K/n)
-    K = K * n  # Now K = G^T G (unnormalized)
-
-    # Step 2: Precompute M = (λnI + K)^{-1} using eigendecomposition
-    # Eigendecomposition is more numerically stable than Cholesky for small λ
-    print(f"  Computing eigendecomposition of (λnI + K)...")
-    reg_matrix = K + lamb * n * torch.eye(n, device=device, dtype=dtype)
-    eigenvalues, eigenvectors = torch.linalg.eigh(reg_matrix)
-    inv_eigenvalues = 1.0 / eigenvalues
-    del reg_matrix, eigenvalues
-    clear_memory(device)
-
-    # Step 3: For each probe, compute u = G^T z, then estimate = u^T M^{-1} u
-    # We batch the probes for efficiency: compute U = G^T Z for all probes at once
-    print(f"  Computing {num_probes} Hutchinson probes (batched)...")
-
-    # Generate all probe vectors at once
-    Z = torch.randn(d, num_probes, device=device, dtype=dtype)
-
-    # Compute U = G^T Z by streaming over gradients (one pass!)
-    U = torch.zeros(n, num_probes, device=device, dtype=dtype)
-    for i_start in tqdm(range(0, n, batch_size), desc="  Computing G^T Z"):
-        i_end = min(i_start + batch_size, n)
-        G_batch = gradients.get_batch(i_start, i_end, device=device)
-        # G_batch is (batch_size, d), Z is (d, num_probes)
-        # U[i_start:i_end] = G_batch @ Z is (batch_size, num_probes)
-        U[i_start:i_end] = G_batch @ Z
-        del G_batch
-
-    del Z
-    clear_memory(device)
-
-    # Step 4: Compute estimates = diag(U^T M^{-1} U) = diag(U^T (λnI + K)^{-1} U)
-    # M^{-1} = V @ diag(1/eigenvalues) @ V^T, so X = V @ diag(1/λ) @ V^T @ U
-    X = eigenvectors @ (inv_eigenvalues.unsqueeze(1) * (eigenvectors.T @ U))
-    estimates = (U * X).sum(dim=0)  # Element-wise multiply and sum over n dimension
-
-    del U, X, eigenvectors, inv_eigenvalues, K
-    clear_memory(device)
-
-    mean_estimate = estimates.mean().item()
-    std_error = (estimates.std() / (num_probes ** 0.5)).item()
-
-    return mean_estimate, std_error
-
-def _matvec_streaming(
-    cache: "GradientCache",
-    v: Tensor,
-    lamb: float,
-    device: str,
-    batch_size: int = 500,
-) -> Tensor:
-    """
-    Compute (F + λI) v = (1/n) G^T (G v) + λv using streaming.
-
-    Args:
-        cache: GradientCache containing gradients
-        v: Vector to multiply (d,) on GPU
-        lamb: Regularization parameter
-        device: GPU device
-        batch_size: Batch size for streaming
-
-    Returns:
-        result: (F + λI) v on GPU
-    """
-    n = cache.n_samples
-    d = v.shape[0]
-
-    # First compute G @ v in streaming fashion
-    Gv = torch.zeros(n, device=device)
-    for i_start in range(0, n, batch_size):
-        i_end = min(i_start + batch_size, n)
-        G_batch = cache.get_batch(i_start, i_end, device=device)
-        Gv[i_start:i_end] = G_batch @ v
-        del G_batch
-
-    # Then compute G^T @ (G @ v) in streaming fashion
-    GTGv = torch.zeros(d, device=device)
-    for i_start in range(0, n, batch_size):
-        i_end = min(i_start + batch_size, n)
-        G_batch = cache.get_batch(i_start, i_end, device=device)
-        GTGv += G_batch.T @ Gv[i_start:i_end]
-        del G_batch
-
-    # F v = (1/n) G^T G v
-    Fv = GTGv / n
-
-    return Fv + lamb * v
-
-
-def _cg_solve_fisher_streaming(
-    cache: "GradientCache",
-    b: Tensor,
-    lamb: float,
-    device: str,
-    max_iter: int = 100,
-    tol: float = 1e-6,
-    batch_size: int = 50,
-) -> Tensor:
-    """
-    Solve (F + λI) x = b using CG with streaming gradient access.
-
-    Args:
-        cache: GradientCache containing gradients
-        b: RHS vector (d,) on GPU
-        lamb: Regularization
-        device: GPU device
-        max_iter: Maximum iterations
-        tol: Convergence tolerance
-        batch_size: Batch size for streaming
-
-    Returns:
-        x: Solution vector on GPU
-    """
-    d = b.shape[0]
-    dtype = b.dtype
-
-    def matvec(v):
-        return _matvec_streaming(cache, v, lamb, device, batch_size)
-
-    # Initialize
-    x = torch.zeros(d, device=device, dtype=dtype)
-    r = b - matvec(x)
-    p = r.clone()
-    rs_old = torch.dot(r, r)
-
-    for _ in range(max_iter):
-        Ap = matvec(p)
-        alpha = rs_old / torch.dot(p, Ap)
-        x = x + alpha * p
-        r = r - alpha * Ap
-        rs_new = torch.dot(r, r)
-
-        if rs_new.sqrt() < tol:
-            break
-
-        p = r + (rs_new / rs_old) * p
-        rs_old = rs_new
-
-    return x
-
-def compute_sandwich_bounds(
-    gradients: "GradientCache",
-    projector: Union[Tensor, Any],
-    lamb: float,
-    test_vectors: Optional[Union[list, Tensor]] = None,
-    num_test_vectors: int = 50,
-    device: str = "cuda",
-    batch_size: int = 500,
-    K: Optional[Tensor] = None,
-) -> dict:
-    """
-    Compute sandwich bounds for sketched inverse approximation quality.
-
-    Automatically handles:
-    - Dense projection matrix (Tensor) or dattri projector (from make_random_projector)
-    - Woodbury identity (if K provided) or CG for exact scores
-
-    Args:
-        gradients: GradientCache containing the gradients
-        projector: Either a (m, d) projection matrix or a dattri projector with .project() method
-        lamb: Regularization parameter λ
-        test_vectors: Test vectors. If None, uses first num_test_vectors from gradients.
-        num_test_vectors: Number of test vectors if not provided
-        device: GPU device for computation
-        batch_size: Batch size for streaming operations
-        K: Pre-computed Gram matrix (n, n) for Woodbury. If None, uses CG.
-
-    Returns:
-        Dictionary with exact_scores, sketched_scores, ratios, and statistics
-    """
-    has_project_method = hasattr(projector, 'project')
-
-    n = gradients.n_samples
-    d = gradients.dim
-    dtype = gradients.dtype
-
-    if has_project_method:
-        m = projector.proj_dim
+    if return_gram:
+        return eigenvalues, effective_dims, K
     else:
-        m = projector.shape[0]
-
-    # Handle test vectors
-    if test_vectors is None:
-        test_vectors = [gradients.get_sample(i, device="cpu") for i in range(min(num_test_vectors, n))]
-
-    k = len(test_vectors) if isinstance(test_vectors, list) else test_vectors.shape[0]
-
-    # Convert test vectors to tensor if needed
-    if isinstance(test_vectors, list):
-        V = torch.stack(test_vectors).to(device)  # (k, d)
-    else:
-        V = test_vectors.to(device)
-
-    # Compute PFP^T
-    PFPT = _compute_pfpt(gradients, projector, n, m, dtype, device, batch_size, has_project_method)
-
-    # Add regularization
-    PFPT_reg = PFPT + lamb * torch.eye(m, device=device, dtype=dtype)
-    del PFPT
-
-    # Compute all scores (batched for efficiency)
-    exact_scores = _compute_exact_scores(
-        V, gradients, lamb, device, batch_size, K
-    )
-
-    sketched_scores = _compute_sketched_scores(
-        V, projector, PFPT_reg, has_project_method, batch_size
-    )
-
-    del PFPT_reg, V
-    clear_memory(device)
-
-    return _format_results(exact_scores, sketched_scores)
+        return eigenvalues, effective_dims
 
 
-def _compute_pfpt(
-    gradients: "GradientCache",
+# =============================================================================
+# Shared Projection and Kernel Utilities
+# =============================================================================
+
+def project_gradients_to_cpu(
+    grad_cache: GradientCache,
     projector,
-    n: int,
-    m: int,
-    dtype,
-    device: str,
-    batch_size: int,
-    has_project_method: bool,
-) -> Tensor:
-    """Compute projected Fisher PFP^T."""
-    PFPT = torch.zeros(m, m, device=device, dtype=dtype)
-
-    for i_start in tqdm(range(0, n, batch_size), desc="Computing PFP^T"):
-        i_end = min(i_start + batch_size, n)
-        G_batch = gradients.get_batch(i_start, i_end, device=device)
-
-        if has_project_method:
-            PG_batch = projector.project(G_batch, ensemble_id=0)
-        else:
-            PG_batch = (projector @ G_batch.T).T
-
-        PFPT += PG_batch.T @ PG_batch
-        del G_batch, PG_batch
-        clear_memory(device)
-
-    return PFPT / n
-
-
-def _compute_exact_scores(
-    V: Tensor,
-    gradients: "GradientCache",
-    lamb: float,
-    device: str,
-    batch_size: int,
-    K: Optional[Tensor],
-) -> Tensor:
+    device: str = "cuda",
+    batch_size: int = 64,
+    test_vectors: Optional[Tensor] = None,
+) -> Union[Tensor, Tuple[Tensor, Tensor]]:
     """
-    Compute exact scores v^T (F + λI)^{-1} v for all test vectors in batch.
+    Project all gradients and store on CPU, optionally computing cross-products.
+
+    This is the first step in Woodbury-based methods when m > n.
 
     Args:
-        V: Test vectors of shape (k, d) on device
-        gradients: GradientCache containing the gradients
-        lamb: Regularization parameter
-        device: GPU device
+        grad_cache: GradientCache containing the gradients
+        projector: dattri projector with .project() method
+        device: GPU device for projection
         batch_size: Batch size for streaming
-        K: Pre-computed Gram matrix (n, n) or None
+        test_vectors: Optional projected test vectors (k, m) on device.
+                      If provided, also computes U = PG @ test_vectors^T
 
     Returns:
-        Tensor of shape (k,) containing exact scores
+        PG: Projected gradients (n, m) on CPU
+        U (optional): Cross-product matrix (n, k) on device if test_vectors provided
     """
-    k, d = V.shape
-    dtype = V.dtype
-    n = gradients.n_samples
+    n = grad_cache.n_samples
+    m = projector.proj_dim
+    dtype = grad_cache.dtype
 
-    if K is not None:
-        # Batched Woodbury: score_i = (1/λ) [||v_i||² - u_i^T x_i]
-        # where u_i = G @ v_i and (nλI + K) x_i = u_i
+    PG_cpu = torch.zeros(n, m, dtype=dtype, device="cpu")
 
-        # Compute U = G @ V^T -> (n, k), so U[:, i] = G @ v_i
+    # Optionally compute U = PG @ PV^T
+    if test_vectors is not None:
+        k = test_vectors.shape[0]
         U = torch.zeros(n, k, device=device, dtype=dtype)
-        for i_start in range(0, n, batch_size):
-            i_end = min(i_start + batch_size, n)
-            G_batch = gradients.get_batch(i_start, i_end, device=device)
-            U[i_start:i_end, :] = G_batch @ V.T  # (batch, k)
-            del G_batch
 
-        # Solve (nλI + K) X = U for all columns at once
-        K_dev = K.to(device)
-        reg_matrix = K_dev + n * lamb * torch.eye(n, device=device, dtype=K_dev.dtype)
-        X = torch.linalg.solve(reg_matrix, U)  # (n, k)
+    for i_start in range(0, n, batch_size):
+        i_end = min(i_start + batch_size, n)
+        g_batch = grad_cache.get_batch(i_start, i_end, device=device)
+        pg_batch = projector.project(g_batch, ensemble_id=0)
+        PG_cpu[i_start:i_end] = pg_batch.cpu()
 
-        # Compute scores: score_i = (1/λ) [||v_i||² - u_i^T x_i]
-        v_norms_sq = (V ** 2).sum(dim=1)  # (k,)
-        ux_dots = (U * X).sum(dim=0)  # (k,) - dot products for each column
-        scores = (v_norms_sq - ux_dots) / lamb
+        if test_vectors is not None:
+            U[i_start:i_end] = pg_batch @ test_vectors.T
 
-        del U, X, K_dev, reg_matrix
-        return scores
-    else:
-        # Fall back to CG for each vector (can't easily batch CG)
-        scores = torch.zeros(k, device=device, dtype=dtype)
-        for i in tqdm(range(k), desc="Computing exact scores (CG)"):
-            v = V[i]
-            exact_v = _cg_solve_fisher_streaming(
-                gradients, v, lamb, device,
-                max_iter=200, tol=1e-8, batch_size=batch_size
-            )
-            scores[i] = torch.dot(v, exact_v)
-            del exact_v
-        return scores
+    if test_vectors is not None:
+        return PG_cpu, U
+    return PG_cpu
 
 
-def _compute_sketched_scores(
-    V: Tensor,
-    projector,
-    PFPT_reg: Tensor,
-    has_project_method: bool,
-    batch_size: int = 500,
+def compute_kernel_from_projected(
+    PG_cpu: Tensor,
+    device: str = "cuda",
+    batch_size: int = 128,
+    normalize: bool = True,
 ) -> Tensor:
     """
-    Compute sketched scores v^T P^T (PFP^T + λI)^{-1} P v for all test vectors.
+    Compute kernel matrix K = PG @ PG^T from projected gradients.
 
     Args:
-        V: Test vectors of shape (k, d) on device
-        projector: Either a (m, d) projection matrix or a dattri projector
-        PFPT_reg: Regularized PFP^T matrix of shape (m, m)
-        has_project_method: Whether projector is a dattri projector (has .project() method)
-        batch_size: Batch size for operator projection
+        PG_cpu: Projected gradients (n, m) on CPU
+        device: GPU device for computation
+        batch_size: Batch size for block computation
+        normalize: If True, divide by n (default). If False, return raw kernel.
 
     Returns:
-        Tensor of shape (k,) containing sketched scores
+        K: Kernel matrix (n, n) on device
     """
-    k = V.shape[0]
-    device = V.device
-    dtype = V.dtype
+    n = PG_cpu.shape[0]
+    dtype = PG_cpu.dtype
 
-    # Project all test vectors: PV has shape (k, m)
-    if has_project_method:
-        # Process in batches if needed
-        if k <= batch_size:
-            PV = projector.project(V, ensemble_id=0)  # (k, m)
-        else:
-            PV_list = []
-            for i_start in range(0, k, batch_size):
-                i_end = min(i_start + batch_size, k)
-                PV_batch = projector.project(V[i_start:i_end], ensemble_id=0)
-                PV_list.append(PV_batch)
-            PV = torch.cat(PV_list, dim=0)  # (k, m)
-    else:
-        PV = (projector @ V.T).T  # (k, m)
+    K = torch.zeros(n, n, device=device, dtype=dtype)
 
-    # Solve (PFP^T + λI) X = PV^T for all columns at once
-    # X has shape (m, k)
-    X = torch.linalg.solve(PFPT_reg, PV.T)  # (m, k)
+    kernel_batch_size = min(batch_size * 4, n)
 
-    # Compute scores: score_i = PV[i] @ X[:, i]
-    scores = (PV * X.T).sum(dim=1)  # (k,)
+    for i_start in range(0, n, kernel_batch_size):
+        i_end = min(i_start + kernel_batch_size, n)
+        pg_i = PG_cpu[i_start:i_end].to(device)
 
-    del PV, X
-    return scores
+        for j_start in range(i_start, n, kernel_batch_size):
+            j_end = min(j_start + kernel_batch_size, n)
+            pg_j = PG_cpu[j_start:j_end].to(device)
 
+            block = pg_i @ pg_j.T
+            K[i_start:i_end, j_start:j_end] = block
 
-def _format_results(exact_scores: Tensor, sketched_scores: Tensor) -> dict:
-    """Format results into standard output dictionary."""
-    # Ensure tensors are on CPU for output
-    exact_scores = exact_scores.detach().cpu()
-    sketched_scores = sketched_scores.detach().cpu()
+            if i_start != j_start:
+                K[j_start:j_end, i_start:i_end] = block.T
 
-    # Use relative threshold based on score magnitude to handle different scales
-    # A score is valid if it's > 1e-10 * max(|scores|) or > 1e-12 (absolute floor)
-    max_score = exact_scores.abs().max()
-    relative_threshold = max(1e-10 * max_score.item(), 1e-12)
-    valid_mask = exact_scores.abs() > relative_threshold
+    if normalize:
+        K = K / n
 
-    ratios = torch.zeros_like(exact_scores)
-    ratios[valid_mask] = sketched_scores[valid_mask] / exact_scores[valid_mask]
-
-    n_valid = valid_mask.sum().item()
-    n_total = len(exact_scores)
-
-    return {
-        "exact_scores": exact_scores,
-        "sketched_scores": sketched_scores,
-        "ratios": ratios,
-        "mean_ratio": ratios[valid_mask].mean().item() if valid_mask.any() else float('nan'),
-        "std_ratio": ratios[valid_mask].std().item() if valid_mask.any() else float('nan'),
-        "max_ratio": ratios[valid_mask].max().item() if valid_mask.any() else float('nan'),
-        "min_ratio": ratios[valid_mask].min().item() if valid_mask.any() else float('nan'),
-        "n_valid": n_valid,
-        "n_total": n_total,
-        "valid_fraction": n_valid / n_total if n_total > 0 else 0.0,
-    }
+    return K

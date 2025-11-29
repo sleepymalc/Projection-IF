@@ -4,424 +4,487 @@ Spectrum Bounds Validation: Validate Regularized Sketching Bounds
 
 import argparse
 import os
-import sys
-from pathlib import Path
+from dataclasses import dataclass
 
 import numpy as np
 import torch
-import matplotlib.pyplot as plt
 from tqdm import tqdm
 
-# Add experiments directory to path for local utils
-experiments_dir = Path(__file__).resolve().parent
-sys.path.insert(0, str(experiments_dir))
+from typing import Union
+from torch import Tensor
 
-from utils.fisher_utils import (
-    compute_eigenvalues,
-    compute_effective_dimension,
-    compute_sandwich_bounds,
-    compute_gram_matrix,
-    compute_per_sample_gradients,
-    clear_memory,
-)
 from dattri.func.projection import (
     make_random_projector,
     ProjectionType,
 )
+from dattri.benchmark.load import load_benchmark
+from utils.fisher_utils import (
+    compute_eigenspectrum,
+    project_gradients_to_cpu,
+    compute_kernel_from_projected,
+)
 from utils.gradient_cache import GradientCache
 
 
-def load_gradients(
-    dataset: str,
-    model: str,
-    device: str,
-    n_samples: int,
-    batch_size: int = 32,
-) -> list:
+# =============================================================================
+# Woodbury Precomputation
+# =============================================================================
+
+@dataclass
+class WoodburyPrecomputed:
+    """Precomputed quantities for fast Woodbury solves across multiple λ values.
+
+    Given projected gradients PG (n, m), we precompute:
+    - K_proj = (1/n) PG @ PG^T  (n×n kernel matrix)
+    - eigenvalues, eigenvectors of K_proj
+    - PV = projected test vectors (k, m)
+    - U = (1/√n) PG @ PV^T  (n×k matrix for Woodbury formula)
+    - pv_norms_sq = ||Pv_i||² for each test vector
+
+    Then for any λ, sketched scores can be computed in O(n²) instead of O(n³).
     """
-    Load model and compute per-sample gradients using vmap for efficiency.
+    eigenvalues: Tensor      # (n,) eigenvalues of K_proj
+    eigenvectors: Tensor     # (n, n) eigenvectors of K_proj
+    U: Tensor                # (n, k) matrix for Woodbury
+    pv_norms_sq: Tensor      # (k,) squared norms of projected test vectors
+    n: int                   # number of training samples
+
+
+def precompute_woodbury(
+    grad_cache: GradientCache,
+    projector,
+    test_vectors: Tensor,
+    device: str = "cuda",
+    batch_size: int = 64,
+) -> WoodburyPrecomputed:
+    """
+    Precompute quantities for fast Woodbury solves across multiple λ values.
+
+    This function:
+    1. Projects test vectors → PV
+    2. Projects all gradients → PG, computing U = PG @ PV^T simultaneously
+    3. Computes K_proj = (1/n) PG @ PG^T
+    4. Computes eigendecomposition of K_proj
+
+    After this, solving for any λ is O(n²) instead of O(n³).
 
     Args:
-        dataset: Dataset name (e.g., "mnist", "cifar10", "maestro")
-        model: Model name (e.g., "mlp", "resnet9", "musictransformer")
-        device: Device for computation
-        n_samples: Number of samples to compute gradients for
-        batch_size: Batch size for vmap gradient computation
+        grad_cache: GradientCache containing the training gradients
+        projector: dattri projector with .project() method
+        test_vectors: Test vectors (k, d) on device
+        device: GPU device
+        batch_size: Batch size for streaming
 
     Returns:
-        List of gradient tensors on CPU, each of shape (d,)
+        WoodburyPrecomputed containing all precomputed quantities
     """
-    from dattri.benchmark.load import load_benchmark
+    n = grad_cache.n_samples
 
-    model_details, _ = load_benchmark(model=model, dataset=dataset, metric="lds")
-    nn_model = model_details["model"]
-    train_dataset = model_details["train_dataset"]
-    train_sampler = model_details["train_sampler"]
-    indices = list(train_sampler)[:n_samples]
+    # Step 1: Project test vectors → PV (k, m)
+    PV = projector.project(test_vectors, ensemble_id=0)
+    pv_norms_sq = (PV ** 2).sum(dim=1)  # (k,)
 
-    model_type = "musictransformer" if model == "musictransformer" else "default"
-    return compute_per_sample_gradients(
-        model=nn_model,
-        dataset=train_dataset,
-        indices=indices,
-        device=device,
-        batch_size=batch_size,
-        model_type=model_type,
+    # Step 2: Project all gradients and compute U = PG @ PV^T simultaneously
+    PG_cpu, U = project_gradients_to_cpu(grad_cache, projector, device, batch_size, test_vectors=PV)
+
+    # Scale U by 1/√n
+    U = U / (n ** 0.5)
+
+    # Step 3: Compute kernel K_proj = (1/n) PG @ PG^T
+    K_proj = compute_kernel_from_projected(PG_cpu, device, batch_size, normalize=True)
+
+    # Step 4: Eigendecomposition (O(n³) but done only once)
+    eigenvalues, eigenvectors = torch.linalg.eigh(K_proj)
+
+    return WoodburyPrecomputed(
+        eigenvalues=eigenvalues,
+        eigenvectors=eigenvectors,
+        U=U,
+        pv_norms_sq=pv_norms_sq,
+        n=n,
     )
 
 
-def compute_empirical_epsilon(
-    gradients_cpu: list,
+def compute_scores(
+    A: Tensor,
+    B: Tensor,
+    grad_cache: GradientCache,
     lamb: float,
-    m: int,
-    proj_type: ProjectionType,
-    num_trials: int = 5,
-    num_test_grads: int = 200,
-    seed: int = 42,
-    device: str = "cuda",
-    batch_size: int = 100,
-    K: torch.Tensor = None,
-    use_held_out_gradients: bool = False,
-) -> dict:
+    device: str,
+    batch_size: int,
+    K: Tensor,
+) -> Tensor:
     """
-    Compute the empirical ε for a given (m, λ) configuration.
+    Compute influence scores A^T (F + λI)^{-1} B (unsketched).
 
-    By default, uses all gradients to form F and tests on a subset of those same
-    gradients (which are truly in range(F)).
+    For self-scores, pass A=B and use result.diag().
+
+    Uses Woodbury identity:
+        scores[i,j] = (1/λ)[a_i^T b_j - u_a[i]^T (K + nλI)^{-1} u_b[j]]
+    where u_a = G @ a and u_b = G @ b.
 
     Args:
-        gradients_cpu: List of gradient tensors on CPU
+        A: Left vectors of shape (k_A, d) on device
+        B: Right vectors of shape (k_B, d) on device
+        grad_cache: GradientCache containing the gradients
         lamb: Regularization parameter
-        m: Projection dimension
-        proj_type: Type of random projection
-        num_trials: Number of projection trials
-        num_test_grads: Number of gradients to use for testing
-        seed: Random seed
         device: GPU device
-        batch_size: Batch size for GPU operations
-        K: Pre-computed Gram matrix (n, n) for Woodbury. If None, computed on demand.
-        use_held_out_gradients: If True, hold out test gradients from FIM construction
-                                (old behavior). If False (default), use all gradients
-                                for FIM and test on a subset of them.
+        batch_size: Batch size for streaming
+        K: Pre-computed Gram matrix (n, n), unnormalized
 
     Returns:
-        Dictionary with statistics about the approximation quality.
+        Tensor of shape (k_A, k_B) containing influence scores
     """
-    # Handle both list and GradientCache
-    if hasattr(gradients_cpu, 'n_samples'):
-        # GradientCache
-        n = gradients_cpu.n_samples
-        d = gradients_cpu.dim
-        dtype = torch.float32  # Default dtype for GradientCache
+    k_A = A.shape[0]
+    k_B = B.shape[0]
+    dtype = A.dtype
+    n = grad_cache.n_samples
+
+    # Compute U_A = G @ A^T -> (n, k_A)
+    U_A = torch.zeros(n, k_A, device=device, dtype=dtype)
+    for i_start in range(0, n, batch_size):
+        i_end = min(i_start + batch_size, n)
+        G_batch = grad_cache.get_batch(i_start, i_end, device=device)
+        U_A[i_start:i_end, :] = G_batch @ A.T
+
+    # Check if A and B are the same tensor (self-scores optimization)
+    same_AB = A.data_ptr() == B.data_ptr()
+
+    if same_AB:
+        U_B = U_A
     else:
-        # List of tensors
-        n = len(gradients_cpu)
-        d = gradients_cpu[0].shape[0]
-        dtype = gradients_cpu[0].dtype
+        # Compute U_B = G @ B^T -> (n, k_B)
+        U_B = torch.zeros(n, k_B, device=device, dtype=dtype)
+        for i_start in range(0, n, batch_size):
+            i_end = min(i_start + batch_size, n)
+            G_batch = grad_cache.get_batch(i_start, i_end, device=device)
+            U_B[i_start:i_end, :] = G_batch @ B.T
 
-    if use_held_out_gradients:
-        # Old behavior: hold out some gradients from FIM construction
-        # This mode requires list access - convert GradientCache to list
-        if hasattr(gradients_cpu, 'to_list'):
-            gradients_list = gradients_cpu.to_list(device="cpu")
-        else:
-            gradients_list = gradients_cpu
-        n_fisher = n - num_test_grads
-        gradients_fisher = gradients_list[:n_fisher]
-        gradients_test = gradients_list[n_fisher:]
+    # Solve (nλI + K) X_B = U_B
+    K_dev = K.to(device)
+    reg_matrix = K_dev + n * lamb * torch.eye(n, device=device, dtype=K_dev.dtype)
+    X_B = torch.linalg.solve(reg_matrix, U_B)  # (n, k_B)
 
-        # Compute Gram matrix K for Woodbury (efficient for exact score computation)
-        if K is not None:
-            # K was computed on full gradients, recompute for fisher subset
-            print(f"  Computing Gram matrix for n={n_fisher} samples...")
-            K_fisher = compute_gram_matrix(gradients_fisher, device=device, batch_size=batch_size)
-            K_fisher = K_fisher * n_fisher  # Unnormalize for Woodbury formula
-        else:
-            K_fisher = None
+    # Compute scores: scores[i,j] = (1/λ)[a_i^T b_j - u_a[i]^T x_b[j]]
+    A_dot_B = A @ B.T  # (k_A, k_B)
+    cross_term = U_A.T @ X_B  # (k_A, k_B)
+    scores = (A_dot_B - cross_term) / lamb
+
+    return scores
+
+
+# =============================================================================
+# Sandwich Bounds (local to this experiment)
+# =============================================================================
+
+def compute_sandwich_bounds(
+    grad_cache: GradientCache,
+    projector,
+    lamb: float,
+    test_vectors: Union[list, Tensor],
+    exact_scores: Tensor,
+    device: str = "cuda",
+    batch_size: int = 500,
+    precomputed: WoodburyPrecomputed = None,
+) -> dict:
+    """
+    Compute sandwich bounds for sketched inverse approximation quality.
+
+    Uses adaptive strategy: kernel method (Woodbury) when m > n to avoid
+    allocating the m×m matrix PFP^T.
+
+    Args:
+        grad_cache: GradientCache containing the gradients
+        projector: dattri projector with .project() method (from make_random_projector)
+        lamb: Regularization parameter λ
+        test_vectors: Test vectors (list of tensors or stacked tensor)
+        exact_scores: Pre-computed exact scores
+        device: GPU device for computation
+        batch_size: Batch size for streaming operations
+        precomputed: Optional WoodburyPrecomputed from precompute_woodbury().
+                     If provided and m > n, uses O(n²) solve instead of O(n³).
+
+    Returns:
+        Dictionary with exact_scores, sketched_scores, ratios, and statistics
+    """
+    n = grad_cache.n_samples
+    m = projector.proj_dim
+    dtype = grad_cache.dtype
+
+    # Convert test vectors to tensor if needed
+    if isinstance(test_vectors, list):
+        V = torch.stack(test_vectors).to(device)  # (k, d)
     else:
-        # Default: use all gradients for FIM, test on a subset of them
-        gradients_fisher = gradients_cpu
-        # Get test gradients - handle both list and GradientCache
-        if hasattr(gradients_cpu, 'get_batch'):
-            # GradientCache - use get_batch for efficient access
-            gradients_test = [gradients_cpu.get_sample(i, device="cpu") for i in range(min(num_test_grads, n))]
-        else:
-            gradients_test = gradients_cpu[:num_test_grads]
-        # Unnormalize K for Woodbury: K was computed as G G^T / n, but Woodbury needs G G^T
-        K_fisher = K * n if K is not None else None
+        V = test_vectors.to(device)
 
-    all_ratios = []
-    all_errors = []
+    # Adaptive strategy for sketched scores:
+    if m > n: # Use Woodbury method
+        assert precomputed is not None
+        # Use precomputed eigendecomposition for O(n²) solve
+        inv_eigvals = 1.0 / (precomputed.eigenvalues + lamb)  # (n,)
+        W = precomputed.eigenvectors.T @ precomputed.U  # (n, k)
+        X = precomputed.eigenvectors @ (inv_eigvals.unsqueeze(1) * W)  # (n, k)
 
-    for trial in range(num_trials):
-        trial_seed = seed + trial
+        # score_i = (1/λ)[||Pv_i||² - u_i^T x_i]
+        ux_dots = (precomputed.U * X).sum(dim=0)  # (k,)
+        sketched_scores = (precomputed.pv_norms_sq - ux_dots) / lamb
+    else:
+        # Standard method: form m×m PFP^T directly and solve
+        PFPT = torch.zeros(m, m, device=device, dtype=dtype)
 
-        # Use dattri's make_random_projector factory
-        # proj_max_batch_size must be multiple of 8
-        proj_max_batch_size = min(batch_size, 32)
-        proj_max_batch_size = max(8, (proj_max_batch_size // 8) * 8)
+        for i_start in range(0, n, batch_size):
+            i_end = min(i_start + batch_size, n)
+            G_batch = grad_cache.get_batch(i_start, i_end, device=device)
+            PG_batch = projector.project(G_batch, ensemble_id=0)
+            PFPT += PG_batch.T @ PG_batch
 
-        projector = make_random_projector(
-            param_shape_list=[d],  # flat gradients of dimension d
-            feature_batch_size=batch_size,
-            proj_dim=m,
-            proj_max_batch_size=proj_max_batch_size,
-            device=torch.device(device),
-            proj_seed=trial_seed,
-            proj_type=proj_type,
-            dtype=dtype,
-        )
+        PFPT /= n
+        PFPT.diagonal().add_(lamb)
 
-        bounds = compute_sandwich_bounds(
-            gradients=gradients_fisher,
-            projector=projector,
-            lamb=lamb,
-            test_vectors=gradients_test,
-            num_test_vectors=num_test_grads,
-            device=device,
-            batch_size=batch_size,
-            K=K_fisher,
-        )
+        # Project test vectors and solve
+        PV = projector.project(V, ensemble_id=0)
+        X = torch.linalg.solve(PFPT, PV.T)  # (m, k)
+        sketched_scores = (PV * X.T).sum(dim=1)  # (k,)
 
-        if hasattr(projector, 'free_memory'):
-            projector.free_memory()
-        del projector
+    exact_scores = exact_scores.detach().cpu()
+    sketched_scores = sketched_scores.detach().cpu()
 
-        for ratio in bounds["ratios"].tolist():
-            if not np.isnan(ratio):
-                all_ratios.append(ratio)
-                all_errors.append(abs(ratio - 1))
+    # Use relative threshold based on score magnitude to handle different scales
+    max_score = exact_scores.abs().max()
+    relative_threshold = max(1e-10 * max_score.item(), 1e-12)
+    valid_mask = exact_scores.abs() > relative_threshold
 
-        clear_memory(device)
+    ratios = torch.zeros_like(exact_scores)
+    ratios[valid_mask] = sketched_scores[valid_mask] / exact_scores[valid_mask]
 
-    # Cleanup (only delete K_fisher if it was newly computed, not if it's the passed-in K)
-    if use_held_out_gradients and K_fisher is not None:
-        del K_fisher
-        clear_memory(device)
-
-    all_ratios = np.array(all_ratios)
-    all_errors = np.array(all_errors)
-
-    # Compute empirical ε: max deviation from 1
-    # Theorem says (1-ε) ≤ ratio ≤ (1+ε), so ε = max(|ratio - 1|)
-    empirical_eps_max = np.max(np.abs(all_ratios - 1))
-    empirical_eps_mean = np.mean(np.abs(all_ratios - 1))
-    empirical_eps_std = np.std(np.abs(all_ratios - 1))
-
-    # Percentiles for understanding distribution
-    eps_95 = np.percentile(np.abs(all_ratios - 1), 95)
-    eps_99 = np.percentile(np.abs(all_ratios - 1), 99)
+    n_valid = valid_mask.sum().item()
+    n_total = len(exact_scores)
 
     return {
-        "m": m,
-        "lambda": lamb,
-        "mean_ratio": np.mean(all_ratios),
-        "std_ratio": np.std(all_ratios),
-        "min_ratio": np.min(all_ratios),
-        "max_ratio": np.max(all_ratios),
-        "empirical_eps_max": empirical_eps_max,
-        "empirical_eps_mean": empirical_eps_mean,
-        "empirical_eps_std": empirical_eps_std,
-        "empirical_eps_95": eps_95,
-        "empirical_eps_99": eps_99,
-        "n_samples": len(all_ratios),
+        "exact_scores": exact_scores,
+        "sketched_scores": sketched_scores,
+        "ratios": ratios,
+        "mean_ratio": ratios[valid_mask].mean().item() if valid_mask.any() else float('nan'),
+        "std_ratio": ratios[valid_mask].std().item() if valid_mask.any() else float('nan'),
+        "max_ratio": ratios[valid_mask].max().item() if valid_mask.any() else float('nan'),
+        "min_ratio": ratios[valid_mask].min().item() if valid_mask.any() else float('nan'),
+        "n_valid": n_valid,
+        "n_total": n_total,
+        "valid_fraction": n_valid / n_total if n_total > 0 else 0.0,
     }
 
 
+# =============================================================================
+# Main Experiment
+# =============================================================================
+
 def run_experiment(
-    gradients_cpu: list,
+    grad_cache: GradientCache,
     lambda_values: list,
     m_multipliers: list,
     proj_type: ProjectionType = ProjectionType.normal,
     num_trials: int = 5,
+    num_test_grads: int = 200,
     seed: int = 42,
     device: str = "cuda",
-    batch_size: int = 100,
+    batch_size: int = 32,
     min_m: int = 10,
     min_d_lambda: float = 5.0,
-    use_held_out_gradients: bool = False,
 ) -> dict:
     """
-    Run the full experiment: for each λ, compute d_λ and test various m values.
-
     Args:
-        gradients_cpu: List of gradient tensors on CPU
+        grad_cache: GradientCache
         lambda_values: List of regularization values
-        m_multipliers: Multipliers of d_λ to test (e.g., [0.25, 0.5, 1, 2, 4])
+        m_multipliers: Multipliers of d_λ to test
         proj_type: Type of random projection
         num_trials: Number of random projection trials per configuration
+        num_test_grads: Number of gradients to use for testing
         seed: Random seed
         device: GPU device
-        batch_size: Batch size for GPU operations (increase for better utilization)
-        min_m: Minimum projection dimension to avoid numerical degeneracy (default: 10)
-        min_d_lambda: Skip λ values where d_λ < this threshold (default: 5.0)
-        use_held_out_gradients: If True, hold out test gradients from FIM construction.
-                                If False (default), use all gradients for FIM.
+        batch_size: Batch size for GPU operations
+        min_m: Minimum projection dimension
+        min_d_lambda: Skip λ values where d_λ < this threshold
 
     Returns:
         Dictionary with all results
     """
-    # Handle both list and GradientCache
-    if hasattr(gradients_cpu, 'n_samples'):
-        # GradientCache
-        n = gradients_cpu.n_samples
-        d = gradients_cpu.dim
-    else:
-        # List of tensors
-        n = len(gradients_cpu)
-        d = gradients_cpu[0].shape[0]
+    n = grad_cache.n_samples
+    d = grad_cache.dim
 
-    print(f"\nRunning experiment with:")
+    print(f"\nRunning experiment:")
     print(f"  - batch_size = {batch_size}")
     print(f"  - n = {n}, d = {d:,}")
     print(f"  - min_m = {min_m}, min_d_lambda = {min_d_lambda}")
+    print(f"  - {len(m_multipliers)} dim ratio × {num_trials} trials × {len(lambda_values)} λ")
 
-    # Compute eigenvalues
-    print(f"\nComputing eigenvalues...")
-    eigenvalues = compute_eigenvalues(gradients_cpu, device=device, batch_size=batch_size)
-    eff_dim_func = lambda lamb: compute_effective_dimension(eigenvalues, lamb)
+    # Compute eigenvalues, effective dimensions, and Gram matrix together
+    print(f"\nComputing eigenvalues and Gram matrix...")
+    eigenvalues, eff_dims, K = compute_eigenspectrum(
+        grad_cache, lambda_values, device=device, batch_size=batch_size*4, return_gram=True
+    )
 
-    # Report eigenvalue statistics for debugging numerical issues
     eig_nonzero = eigenvalues[eigenvalues > 1e-10]
     print(f"  Eigenvalue stats: max={eigenvalues[0]:.2e}, min_nonzero={eig_nonzero[-1]:.2e}, "
           f"n_nonzero={len(eig_nonzero)}/{len(eigenvalues)}")
-
-    # Pre-compute Gram matrix K for Woodbury identity (efficient exact score computation)
-    print("Pre-computing Gram matrix K...")
-    K = compute_gram_matrix(gradients_cpu, device=device, batch_size=batch_size)
+    # Unnormalize for Woodbury formula
+    K_unnorm = K * n
 
     # Compute numerical rank
     threshold = 1e-10 * eigenvalues[0]
     rank = (eigenvalues > threshold).sum().item()
 
+    # Prepare test vectors
+    test_vectors = [grad_cache.get_sample(i, device="cpu") for i in range(min(num_test_grads, n))]
+    V = torch.stack(test_vectors).to(device)  # (k, d)
+
+    # Filter valid λ values (d_λ >= min_d_lambda)
+    valid_lambdas = [lamb for lamb in lambda_values if eff_dims[lamb] >= min_d_lambda]
+    skipped_lambdas = [lamb for lamb in lambda_values if eff_dims[lamb] < min_d_lambda]
+
+    if skipped_lambdas:
+        print(f"\nSkipping {len(skipped_lambdas)} λ values with d_λ < {min_d_lambda}")
+
+    # Precompute exact scores for all λ values (doesn't depend on m or trial)
+    print(f"\nPrecomputing exact scores for {len(valid_lambdas)} λ values...")
+    exact_scores_by_lambda = {}
+    for lamb in valid_lambdas:
+        exact_scores_by_lambda[lamb] = compute_scores(V, V, grad_cache, lamb, device, batch_size, K_unnorm).diag()
+    print(f"  Done. Exact scores cached for all λ values.")
+
+    # Collect all unique m values and build config mapping
+    # m_to_configs: m -> list of config dicts
+    # all_config_ratios: (m, lamb, mult) -> list of ratios (accumulated across trials)
+    m_to_configs = {}
+    all_config_ratios = {}
+
+    for lamb in valid_lambdas:
+        d_lambda = eff_dims[lamb]
+        for mult in m_multipliers:
+            m_raw = mult * d_lambda
+            m = max(min_m, min(int(m_raw), d))
+            m_clamped = (m == min_m and m_raw < min_m)
+
+            if m not in m_to_configs:
+                m_to_configs[m] = []
+            m_to_configs[m].append({
+                "lamb": lamb,
+                "mult": mult,
+                "d_lambda": d_lambda,
+                "m_raw": m_raw,
+                "m_clamped": m_clamped,
+            })
+            all_config_ratios[(m, lamb, mult)] = []
+
+    m_values_sorted = sorted(m_to_configs.keys())
+    print(f"\nUnique projection dimension to test: {len(m_values_sorted)}")
+
+    # Main loop: trial → m → λ
+    for trial in range(num_trials):
+        trial_seed = seed + trial
+        print(f"\nTrial {trial + 1}/{num_trials} (seed={trial_seed})")
+
+        for m in tqdm(m_values_sorted, desc="  projection dimension"):
+            configs = m_to_configs[m]
+
+            # Create projector for this (m, trial)
+            projector = make_random_projector(
+                param_shape_list=[d],
+                feature_batch_size=batch_size,
+                proj_dim=m,
+                proj_max_batch_size=128,
+                device=torch.device(device),
+                proj_seed=trial_seed,
+                proj_type=proj_type,
+                dtype=torch.float32,
+            )
+
+            # For Woodbury (m > n), precompute eigendecomposition once for O(n²) solves
+            precomputed = None
+            if m > n: # Use Woodbury method
+                precomputed = precompute_woodbury(
+                    grad_cache=grad_cache,
+                    projector=projector,
+                    test_vectors=V,
+                    device=device,
+                    batch_size=batch_size,
+                )
+
+            # Unified loop: compute_sandwich_bounds handles both paths
+            for config in configs:
+                lamb = config["lamb"]
+                bounds = compute_sandwich_bounds(
+                    grad_cache=grad_cache,
+                    projector=projector,
+                    lamb=lamb,
+                    test_vectors=test_vectors,
+                    exact_scores=exact_scores_by_lambda[lamb],
+                    device=device,
+                    batch_size=batch_size,
+                    precomputed=precomputed,
+                )
+                ratios = bounds["ratios"].numpy()
+                valid_ratios = ratios[~np.isnan(ratios)]
+                all_config_ratios[(m, lamb, config["mult"])].extend(valid_ratios.tolist())
+
+            # Cleanup projector
+            if hasattr(projector, 'free_memory'):
+                projector.free_memory()
+
+    # Build results dict with metadata and aggregated experiment results
+    print("Aggregating results...")
     results = {
         "n_samples": n,
         "d_params": d,
         "proj_type": proj_type.value,
         "lambda_values": lambda_values,
         "m_multipliers": m_multipliers,
-        "effective_dims": {},
-        "experiments": [],
+        "effective_dims": eff_dims,
         "batch_size": batch_size,
         "min_m": min_m,
         "min_d_lambda": min_d_lambda,
-        "skipped_configs": [],
-        "use_held_out_gradients": use_held_out_gradients,
+        "skipped_configs": [
+            {"lambda": lamb, "d_lambda": eff_dims[lamb],
+             "reason": f"d_lambda ({eff_dims[lamb]:.2f}) < min_d_lambda ({min_d_lambda})"}
+            for lamb in skipped_lambdas
+        ],
+        "use_held_out_gradients": False,
         "eigenvalues": eigenvalues.cpu().numpy(),
         "rank": rank,
+        "experiments": [],
     }
 
-    for lamb in lambda_values:
-        d_lambda = eff_dim_func(lamb)
-        results["effective_dims"][lamb] = d_lambda
+    for m, configs in m_to_configs.items():
+        for config in configs:
+            ratios_list = all_config_ratios[(m, config["lamb"], config["mult"])]
+            if len(ratios_list) == 0:
+                continue
 
-        print(f"\n{'='*60}")
-        print(f"λ = {lamb:.1e}, d_λ = {d_lambda:.1f}")
+            all_ratios = np.array(ratios_list)
+            eps_values = np.abs(all_ratios - 1)
 
-        # Skip λ values with too small effective dimension (numerically degenerate)
-        if d_lambda < min_d_lambda:
-            print(f"  SKIPPED: d_λ = {d_lambda:.2f} < {min_d_lambda} (numerically degenerate)")
-            results["skipped_configs"].append({
-                "lambda": lamb,
-                "d_lambda": d_lambda,
-                "reason": f"d_lambda ({d_lambda:.2f}) < min_d_lambda ({min_d_lambda})"
+            # Build result by extending config with computed statistics
+            results["experiments"].append({
+                "m": m,
+                "lambda": config["lamb"],
+                "multiplier": config["mult"],
+                "d_lambda": config["d_lambda"],
+                "m_raw": config["m_raw"],
+                "m_clamped": config["m_clamped"],
+                "m_over_d_lambda": m / config["d_lambda"] if config["d_lambda"] > 0 else float('inf'),
+                # Ratio statistics
+                "mean_ratio": np.mean(all_ratios),
+                "std_ratio": np.std(all_ratios),
+                "min_ratio": np.min(all_ratios),
+                "max_ratio": np.max(all_ratios),
+                # Epsilon statistics
+                "empirical_eps_max": np.max(eps_values),
+                "empirical_eps_mean": np.mean(eps_values),
+                "empirical_eps_std": np.std(eps_values),
+                "empirical_eps_95": np.percentile(eps_values, 95),
+                "empirical_eps_99": np.percentile(eps_values, 99),
+                "n_samples": len(all_ratios),
             })
-            continue
-
-        print(f"{'='*60}")
-
-        for mult in m_multipliers:
-            # Compute m as multiple of d_λ, with minimum threshold to avoid degeneracy
-            m_raw = mult * d_lambda
-            m = max(min_m, min(int(m_raw), d))
-
-            # Flag if m was clamped to minimum
-            m_clamped = (m == min_m and m_raw < min_m)
-
-            clamped_note = " [CLAMPED]" if m_clamped else ""
-            print(f"\n  Testing m = {m} ({mult}× d_λ = {m_raw:.1f}){clamped_note}...")
-
-            exp_result = compute_empirical_epsilon(
-                gradients_cpu, lamb, m, proj_type,
-                num_trials=num_trials,
-                seed=seed,
-                device=device,
-                batch_size=batch_size,
-                K=K,
-                use_held_out_gradients=use_held_out_gradients,
-            )
-            exp_result["d_lambda"] = d_lambda
-            exp_result["m_over_d_lambda"] = m / d_lambda if d_lambda > 0 else float('inf')
-            exp_result["m_raw"] = m_raw
-            exp_result["m_clamped"] = m_clamped
-            exp_result["multiplier"] = mult
-
-            results["experiments"].append(exp_result)
-
-            print(f"    Ratio: {exp_result['mean_ratio']:.4f} ± {exp_result['std_ratio']:.4f}")
-            print(f"    ε (95th percentile): {exp_result['empirical_eps_95']:.4f}")
-            print(f"    ε (max): {exp_result['empirical_eps_max']:.4f}")
-
-            # Memory cleanup between iterations
-            clear_memory(device)
-
-    # Final cleanup
-    del eigenvalues
-    if K is not None:
-        del K
-    clear_memory(device)
-
     return results
-
-
-def print_summary_table(results: dict):
-    """Print a summary table of the key findings."""
-    print("\n" + "="*80)
-    print("SUMMARY: Spectrum Bounds Validation")
-    print("="*80)
-
-    print(f"\nDataset: n={results['n_samples']}, d={results['d_params']}")
-    print(f"Projection type: {results['proj_type']}")
-
-    # Show stability parameters if present
-    if "min_m" in results:
-        print(f"Stability: min_m={results['min_m']}, min_d_lambda={results['min_d_lambda']}")
-
-    # Report skipped configurations
-    if "skipped_configs" in results and results["skipped_configs"]:
-        print(f"\nSkipped {len(results['skipped_configs'])} λ values (d_λ too small):")
-        for skip in results["skipped_configs"]:
-            print(f"  λ={skip['lambda']:.1e}: {skip['reason']}")
-
-    print("\n" + "-"*90)
-    print(f"{'λ':>10} | {'d_λ':>8} | {'m':>8} | {'m/d_λ':>8} | {'ε_95':>8} | {'ε_max':>8} | {'ratio':>10}")
-    print("-"*90)
-
-    for exp in results["experiments"]:
-        # Mark clamped m values with asterisk
-        m_str = f"{exp['m']:>6}"
-        if exp.get('m_clamped', False):
-            m_str = f"{exp['m']:>5}*"
-
-        print(f"{exp['lambda']:>10.1e} | {exp['d_lambda']:>8.1f} | {m_str:>8} | "
-              f"{exp['m_over_d_lambda']:>8.2f} | {exp['empirical_eps_95']:>8.4f} | "
-              f"{exp['empirical_eps_max']:>8.4f} | {exp['mean_ratio']:>10.4f}")
-
-    print("-"*90)
-    print("  * = m was clamped to min_m (theoretical m/d_λ ratio not meaningful)")
-
-    # Find the m/d_λ threshold where ε < 0.1
-    threshold_eps = 0.1
-    print(f"\nλ values achieving ε_95 < {threshold_eps}:")
-    for lamb in results["lambda_values"]:
-        exps = [e for e in results["experiments"] if e["lambda"] == lamb and not e.get('m_clamped', False)]
-        if not exps:
-            continue
-        exps = sorted(exps, key=lambda x: x["m_over_d_lambda"])
-        for exp in exps:
-            if exp["empirical_eps_95"] < threshold_eps:
-                print(f"  λ={lamb:.0e}: ε < {threshold_eps} when m/d_λ ≥ {exp['m_over_d_lambda']:.2f}")
-                break
 
 
 def main():
@@ -431,15 +494,14 @@ def main():
     parser.add_argument("--dataset", type=str, default="mnist",
                        choices=["mnist", "cifar2", "maestro"])
     parser.add_argument("--model", type=str, default="mlp",
-                       choices=["mlp", "resnet9", "musictransformer"])
-    parser.add_argument("--n_samples", type=int, default=1000, help="Number of training samples")
+                       choices=["lr", "mlp", "resnet9", "musictransformer"])
     parser.add_argument("--num_trials", type=int, default=5, help="Trials per configuration")
     parser.add_argument("--proj_type", type=str, default="normal",
                        choices=["normal", "rademacher", "sjlt"])
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output_dir", type=str, default="./results")
-    parser.add_argument("--batch_size", type=int, default=100,
+    parser.add_argument("--batch_size", type=int, default=32,
                        help="Batch size for GPU operations. Increase for better GPU utilization, "
                             "decrease if running out of memory. Suggested: 50-200 for d~1M, "
                             "10-50 for d~100M.")
@@ -453,30 +515,25 @@ def main():
                        help="Directory for gradient cache (only used with --offload disk)")
 
     # Numerical stability options
-    parser.add_argument("--min_m", type=int, default=10,
+    parser.add_argument("--min_m", type=int, default=1,
                        help="Minimum projection dimension to avoid numerical degeneracy. "
-                            "When mult * d_λ < min_m, m is clamped to min_m. (default: 10)")
+                            "When mult * d_λ < min_m, m is clamped to min_m. (default: 1)")
     parser.add_argument("--min_d_lambda", type=float, default=5.0,
                        help="Skip λ values where d_λ < this threshold (numerically degenerate). "
                             "(default: 5.0)")
-
-    # Gradient handling options
-    parser.add_argument("--hold_out", action="store_true",
-                       help="Hold out test gradients from FIM construction. "
-                            "By default, all gradients are used for FIM and a subset is tested.")
 
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
 
     # Experiment configuration
-    lambda_values = [1e-9, 1e-8, 1e-7, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1e0, 1e1, 1e2, 1e3, 1e4]
-    m_values = [32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576, 2097152]
+    lambda_values = [1e-4, 1e-3, 1e-2, 1e-1, 1e0, 1e1, 1e2, 1e3]
+    m_multipliers = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0]
 
     proj_type = ProjectionType(args.proj_type)
 
     print("\n" + "="*60)
-    print(f"OFFLOAD MODE: {args.offload.upper()}")
+    print(f"Offload Mode: {args.offload.upper()}")
     print("="*60)
     if args.offload == "disk":
         print("- Gradients will be cached to disk")
@@ -489,28 +546,29 @@ def main():
     print("="*60 + "\n")
 
     # Create GradientCache with appropriate offload mode
-    cache = GradientCache(
+    grad_cache = GradientCache(
         offload=args.offload,
         cache_dir=args.cache_dir if args.offload == "disk" else None,
     )
 
+    # Load benchmark to get training data
+    print(f"\nLoading {args.model} on {args.dataset}...")
+
+    model_details, _ = load_benchmark(model=args.model, dataset=args.dataset, metric="lds")
+    nn_model = model_details["model"]
+    train_dataset = model_details["train_dataset"]
+    train_sampler = model_details["train_sampler"]
+    indices = list(train_sampler)
+    n_samples = len(indices)
+
     # For disk mode, check if cache is valid and reuse
     # Note: is_valid() already loads metadata when it returns True
-    if args.offload == "disk" and cache.is_valid(expected_samples=args.n_samples):
+    if args.offload == "disk" and grad_cache.is_valid(expected_samples=n_samples):
         print(f"Loading cached gradients from {args.cache_dir}...")
     else:
         # Need to compute and cache gradients
-        print(f"\nLoading {args.model} on {args.dataset}...")
-        from dattri.benchmark.load import load_benchmark
-
-        model_details, _ = load_benchmark(model=args.model, dataset=args.dataset, metric="lds")
-        nn_model = model_details["model"]
-        train_dataset = model_details["train_dataset"]
-        train_sampler = model_details["train_sampler"]
-        indices = list(train_sampler)[:args.n_samples]
-
         model_type = "musictransformer" if args.model == "musictransformer" else "default"
-        cache.store_gradients(
+        grad_cache.cache(
             model=nn_model,
             dataset=train_dataset,
             indices=indices,
@@ -519,12 +577,9 @@ def main():
             batch_size=args.batch_size,
         )
 
-    # Pass cache to experiment
-    gradients_cpu = cache
-
     # Run experiment
     results = run_experiment(
-        gradients_cpu=gradients_cpu,
+        grad_cache=grad_cache,
         lambda_values=lambda_values,
         m_multipliers=m_multipliers,
         proj_type=proj_type,
@@ -534,7 +589,6 @@ def main():
         batch_size=args.batch_size,
         min_m=args.min_m,
         min_d_lambda=args.min_d_lambda,
-        use_held_out_gradients=args.hold_out,
     )
 
     # Add metadata
@@ -543,19 +597,12 @@ def main():
     results["offload_mode"] = args.offload
     results["batch_size"] = args.batch_size
 
-    # Print summary
-    print_summary_table(results)
-
     # Save results with organized directory structure
     experiment_dir = os.path.join(args.output_dir, "spectrum_bounds")
     os.makedirs(experiment_dir, exist_ok=True)
 
     # Build filename with key settings
-    holdout_suffix = "_holdout" if args.hold_out else ""
-    results_filename = (
-        f"{args.dataset}_{args.model}_{args.proj_type}"
-        f"_n{args.n_samples}{holdout_suffix}.pt"
-    )
+    results_filename = f"{args.dataset}_{args.model}_{args.proj_type}.pt"
     results_path = os.path.join(experiment_dir, results_filename)
     torch.save(results, results_path)
     print(f"\nResults saved to {results_path}")
