@@ -36,7 +36,7 @@ import argparse
 import os
 import sys
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 import torch
@@ -631,9 +631,11 @@ def effective_dimension(
         Dictionary mapping λ -> d_λ
     """
     # Compute eigenvalues once (O(n²d) for Gram + O(n³) for eigendecomp)
+    # Use larger batch size for Gram matrix computation (less memory-intensive than gradients)
     if eigenvalues is None:
         print("  Computing eigenvalues of Gram matrix...")
-        eigenvalues = compute_eigenvalues(gradients, device=device, batch_size=batch_size)
+        gram_batch_size = batch_size * 4  # Gram computation can handle larger batches
+        eigenvalues = compute_eigenvalues(gradients, device=device, batch_size=gram_batch_size)
 
     # Compute d_λ analytically for each λ (O(n) per λ - instant!)
     d_lambda_dict = {}
@@ -916,7 +918,7 @@ def main():
 
     # Define search spaces
     lambda_values = [1e-9, 1e-8, 1e-7, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1e0, 1e1, 1e2, 1e3, 1e4]
-    m_values = [32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576, 2097152, 4194304]
+    m_values = [32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576, 2097152]
 
     # Save results with organized directory structure
     experiment_dir = os.path.join(args.output_dir, "hyperparam_selection")

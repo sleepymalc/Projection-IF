@@ -1,32 +1,5 @@
 """
 Spectrum Bounds Validation: Validate Regularized Sketching Bounds
-
-Validates that the sketched influence score approximation satisfies the (1±ε) sandwich bounds
-for vectors in range(F), as claimed by the regularized sketching theorem.
-
-Theory:
-    For g in range(F):
-        (1-ε) g^T M(λ) g ≤ g^T S(λ) g ≤ (1+ε) g^T M(λ) g
-
-    where:
-        M(λ) = (F + λI)^{-1}           (true regularized inverse)
-        S(λ) = P^T (PFP^T + λI)^{-1} P  (sketched approximation)
-        ε scales as O(√(d_λ/m)) for m >= d_λ
-
-Key Questions:
-    1. For given (m, λ), what is the empirical ε?
-    2. Does ε scale as O(1/√(m/d_λ)) as predicted?
-    3. Is m ≈ d_λ/ε² sufficient for ε-accurate approximation?
-
-Usage:
-    python spectrum_bounds.py --dataset mnist --model mlp
-    python spectrum_bounds.py --dataset maestro --model musictransformer --offload disk
-
-Interpreting Results:
-    - "ratio" = sketched_score / exact_score (should be ≈ 1.0)
-    - "ε_95" = 95th percentile of |ratio - 1| (main metric)
-    - When m/d_λ ≥ 1, expect ε < 0.3 (reasonable approximation)
-    - When m/d_λ ≥ 4, expect ε < 0.1 (good approximation)
 """
 
 import argparse
@@ -497,8 +470,8 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
 
     # Experiment configuration
-    lambda_values = [1e-7, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1.0]
-    m_multipliers = [0.25, 0.4, 0.5, 0.7, 1.0, 2.0, 4.0]  # multiples of d_λ
+    lambda_values = [1e-9, 1e-8, 1e-7, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1e0, 1e1, 1e2, 1e3, 1e4]
+    m_values = [32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576, 2097152]
 
     proj_type = ProjectionType(args.proj_type)
 
