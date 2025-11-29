@@ -292,6 +292,7 @@ def run_experiment(
     min_d_lambda: float = 5.0,
 ) -> dict:
     """
+
     Args:
         grad_cache: GradientCache
         lambda_values: List of regularization values
@@ -426,10 +427,6 @@ def run_experiment(
                 valid_ratios = ratios[~np.isnan(ratios)]
                 all_config_ratios[(m, lamb, config["mult"])].extend(valid_ratios.tolist())
 
-            # Cleanup projector
-            if hasattr(projector, 'free_memory'):
-                projector.free_memory()
-
     # Build results dict with metadata and aggregated experiment results
     print("Aggregating results...")
     results = {
@@ -526,10 +523,6 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Experiment configuration
-    lambda_values = [1e-4, 1e-3, 1e-2, 1e-1, 1e0, 1e1, 1e2, 1e3]
-    m_multipliers = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0]
-
     proj_type = ProjectionType(args.proj_type)
 
     print("\n" + "="*60)
@@ -576,6 +569,10 @@ def main():
             model_type=model_type,
             batch_size=args.batch_size,
         )
+
+    # Experiment configuration
+    lambda_values = [1e-4, 1e-3, 1e-2, 1e-1, 1e0, 1e1, 1e2, 1e3]
+    m_multipliers = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0]
 
     # Run experiment
     results = run_experiment(

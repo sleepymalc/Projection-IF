@@ -34,14 +34,14 @@ pip install -r requirements.txt
 # Basic run
 python spectrum_bounds.py --dataset mnist --model mlp
 
-# With more samples and trials
-python spectrum_bounds.py --dataset mnist --model mlp --n_samples 500 --num_trials 10
+# With more trials
+python spectrum_bounds.py --dataset mnist --model mlp --num_trials 10
 
 # Different projection type
 python spectrum_bounds.py --proj_type sjlt
 
 # Large model (disk-cached gradients)
-python spectrum_bounds.py --dataset maestro --model musictransformer --large_model
+python spectrum_bounds.py --dataset maestro --model musictransformer --offload disk
 ```
 
 ### 2. Hyperparameter Selection (`hyperparam_selection.py`)
@@ -59,32 +59,36 @@ python spectrum_bounds.py --dataset maestro --model musictransformer --large_mod
 
 **Usage:**
 ```bash
-# Full comparison
-python hyperparam_selection.py --dataset mnist --model mlp --mode full
-
-# Just λ sweep with fixed m
-python hyperparam_selection.py --mode lambda_sweep --proj_dim 2048
-
-# Just m sweep with fixed λ
-python hyperparam_selection.py --mode m_sweep --lamb 1e-3
+python hyperparam_selection.py --dataset mnist --model mlp
 ```
 
 ## Command-Line Arguments
 
-| Argument        | Description                           | Default |
-| --------------- | ------------------------------------- | ------- |
-| `--dataset`     | Dataset: mnist, cifar2, maestro       | mnist   |
-| `--model`       | Model: mlp, resnet9, musictransformer | mlp     |
-| `--n_samples`   | Number of training samples            | 500     |
-| `--batch_size`  | GPU batch size (tune for utilization) | 100     |
-| `--proj_type`   | Projection: normal, rademacher, sjlt  | normal  |
-| `--large_model` | Use disk cache for large models       | False   |
-| `--device`      | cuda or cpu                           | cuda    |
+| Argument       | Description                                  | Default      |
+| -------------- | -------------------------------------------- | ------------ |
+| `--dataset`    | Dataset: mnist, cifar2, maestro              | mnist        |
+| `--model`      | Model: lr, mlp, resnet9, musictransformer    | mlp          |
+| `--proj_type`  | Projection: normal, rademacher, sjlt         | normal       |
+| `--batch_size` | GPU batch size (tune for memory/utilization) | 32           |
+| `--offload`    | Gradient storage: none, cpu, disk            | cpu          |
+| `--cache_dir`  | Directory for disk cache                     | ./grad_cache |
+| `--output_dir` | Directory for results                        | ./results    |
+| `--seed`       | Random seed                                  | 42           |
+| `--device`     | cuda or cpu                                  | cuda         |
+
+### Additional Arguments for `spectrum_bounds.py`
+
+| Argument         | Description                              | Default |
+| ---------------- | ---------------------------------------- | ------- |
+| `--num_trials`   | Number of trials per configuration       | 5       |
+| `--min_m`        | Minimum projection dimension             | 1       |
+| `--min_d_lambda` | Skip λ values where d_λ < this threshold | 5.0     |
 
 ## Model/Dataset Configurations
 
-| Model            | Dataset | Parameters | Recommended n_samples |
-| ---------------- | ------- | ---------- | --------------------- |
-| mlp              | mnist   | ~100K      | 500                   |
-| resnet9          | cifar2  | ~6M        | 300                   |
-| musictransformer | maestro | ~13M       | 200                   |
+| Model            | Dataset | Parameters | Recommended Settings |
+| ---------------- | ------- | ---------- | -------------------- |
+| lr               | mnist   | ~8K        | `--offload none`     |
+| mlp              | mnist   | ~100K      | `--offload cpu`      |
+| resnet9          | cifar2  | ~6M        | `--offload cpu`      |
+| musictransformer | maestro | ~13M       | `--offload disk`     |
