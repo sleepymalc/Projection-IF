@@ -10,7 +10,6 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from typing import Union
 from torch import Tensor
 
 from dattri.func.projection import (
@@ -21,7 +20,6 @@ from dattri.benchmark.load import load_benchmark
 from utils.fisher_utils import (
     compute_eigenspectrum,
     project_gradients_to_cpu,
-    compute_kernel_from_projected,
 )
 from utils.gradient_cache import GradientCache
 
@@ -63,8 +61,10 @@ def precompute_woodbury(
     This function:
     1. Projects test vectors → PV
     2. Projects all gradients → PG, computing U = PG @ PV^T simultaneously
-    3. Computes K_proj = (1/n) PG @ PG^T
-    4. Computes eigendecomposition of K_proj
+    3. Computes SVD of PG to get eigenvalues/eigenvectors of K_proj = (1/n) PG @ PG^T
+
+    Using SVD(PG) instead of eigh(K_proj) guarantees non-negative eigenvalues
+    since eigenvalues = S² / n where S are singular values.
 
     After this, solving for any λ is O(n²) instead of O(n³).
 
@@ -87,14 +87,32 @@ def precompute_woodbury(
     # Step 2: Project all gradients and compute U = PG @ PV^T simultaneously
     PG_cpu, U = project_gradients_to_cpu(grad_cache, projector, device, batch_size, test_vectors=PV)
 
-    # Scale U by 1/√n
+    # Scale U by 1/√n for Woodbury formula
     U = U / (n ** 0.5)
 
-    # Step 3: Compute kernel K_proj = (1/n) PG @ PG^T
-    K_proj = compute_kernel_from_projected(PG_cpu, device, batch_size, normalize=True)
+    # Step 3: SVD of PG to get eigenvalues/eigenvectors of K_proj
+    # K_proj = (1/n) PG @ PG.T = (1/n) U_svd @ diag(S²) @ U_svd.T
+    # So eigenvalues = S² / n (always non-negative!) and eigenvectors = U_svd
+    PG_device = PG_cpu.to(device)
 
-    # Step 4: Eigendecomposition (O(n³) but done only once)
-    eigenvalues, eigenvectors = torch.linalg.eigh(K_proj)
+    # Check for NaN/inf values before SVD
+    if torch.isnan(PG_device).any() or torch.isinf(PG_device).any():
+        nan_count = torch.isnan(PG_device).sum().item()
+        inf_count = torch.isinf(PG_device).sum().item()
+        raise ValueError(f"PG contains {nan_count} NaN and {inf_count} inf values before SVD")
+
+    # Try GPU SVD first, fall back to CPU if cusolver fails
+    try:
+        U_svd, S, Vh = torch.linalg.svd(PG_device, full_matrices=False)
+    except torch._C._LinAlgError as e:
+        print(f"  GPU SVD failed ({e}), falling back to CPU...")
+        U_svd, S, Vh = torch.linalg.svd(PG_cpu, full_matrices=False)
+        U_svd = U_svd.to(device)
+        S = S.to(device)
+
+    # eigenvalues of K_proj = S² / n
+    eigenvalues = (S ** 2) / n
+    eigenvectors = U_svd
 
     return WoodburyPrecomputed(
         eigenvalues=eigenvalues,
@@ -178,84 +196,46 @@ def compute_scores(
 # =============================================================================
 
 def compute_sandwich_bounds(
-    grad_cache: GradientCache,
-    projector,
     lamb: float,
-    test_vectors: Union[list, Tensor],
     exact_scores: Tensor,
-    device: str = "cuda",
-    batch_size: int = 500,
-    precomputed: WoodburyPrecomputed = None,
+    precomputed: WoodburyPrecomputed,
 ) -> dict:
     """
     Compute sandwich bounds for sketched inverse approximation quality.
 
-    Uses adaptive strategy: kernel method (Woodbury) when m > n to avoid
-    allocating the m×m matrix PFP^T.
+    Uses the Woodbury method with precomputed eigendecomposition for O(n²) solve.
 
     Args:
-        grad_cache: GradientCache containing the gradients
-        projector: dattri projector with .project() method (from make_random_projector)
         lamb: Regularization parameter λ
-        test_vectors: Test vectors (list of tensors or stacked tensor)
-        exact_scores: Pre-computed exact scores
-        device: GPU device for computation
-        batch_size: Batch size for streaming operations
-        precomputed: Optional WoodburyPrecomputed from precompute_woodbury().
-                     If provided and m > n, uses O(n²) solve instead of O(n³).
+        exact_scores: Pre-computed exact scores (k,)
+        precomputed: WoodburyPrecomputed from precompute_woodbury()
 
     Returns:
         Dictionary with exact_scores, sketched_scores, ratios, and statistics
     """
-    n = grad_cache.n_samples
-    m = projector.proj_dim
-    dtype = grad_cache.dtype
+    # Use precomputed eigendecomposition for O(n²) solve
+    inv_eigvals = 1.0 / (precomputed.eigenvalues + lamb)  # (n,)
+    W = precomputed.eigenvectors.T @ precomputed.U  # (n, k)
+    X = precomputed.eigenvectors @ (inv_eigvals.unsqueeze(1) * W)  # (n, k)
 
-    # Convert test vectors to tensor if needed
-    if isinstance(test_vectors, list):
-        V = torch.stack(test_vectors).to(device)  # (k, d)
-    else:
-        V = test_vectors.to(device)
-
-    # Adaptive strategy for sketched scores:
-    if m > n: # Use Woodbury method
-        assert precomputed is not None
-        # Use precomputed eigendecomposition for O(n²) solve
-        inv_eigvals = 1.0 / (precomputed.eigenvalues + lamb)  # (n,)
-        W = precomputed.eigenvectors.T @ precomputed.U  # (n, k)
-        X = precomputed.eigenvectors @ (inv_eigvals.unsqueeze(1) * W)  # (n, k)
-
-        # score_i = (1/λ)[||Pv_i||² - u_i^T x_i]
-        ux_dots = (precomputed.U * X).sum(dim=0)  # (k,)
-        sketched_scores = (precomputed.pv_norms_sq - ux_dots) / lamb
-    else:
-        # Standard method: form m×m PFP^T directly and solve
-        PFPT = torch.zeros(m, m, device=device, dtype=dtype)
-
-        for i_start in range(0, n, batch_size):
-            i_end = min(i_start + batch_size, n)
-            G_batch = grad_cache.get_batch(i_start, i_end, device=device)
-            PG_batch = projector.project(G_batch, ensemble_id=0)
-            PFPT += PG_batch.T @ PG_batch
-
-        PFPT /= n
-        PFPT.diagonal().add_(lamb)
-
-        # Project test vectors and solve
-        PV = projector.project(V, ensemble_id=0)
-        X = torch.linalg.solve(PFPT, PV.T)  # (m, k)
-        sketched_scores = (PV * X.T).sum(dim=1)  # (k,)
+    # score_i = (1/λ)[||Pv_i||² - u_i^T x_i]
+    ux_dots = (precomputed.U * X).sum(dim=0)  # (k,)
+    sketched_scores = (precomputed.pv_norms_sq - ux_dots) / lamb
 
     exact_scores = exact_scores.detach().cpu()
     sketched_scores = sketched_scores.detach().cpu()
 
-    # Use relative threshold based on score magnitude to handle different scales
-    max_score = exact_scores.abs().max()
-    relative_threshold = max(1e-10 * max_score.item(), 1e-12)
-    valid_mask = exact_scores.abs() > relative_threshold
+    # Cast to same dtype for ratio computation (use float64 for precision)
+    exact_scores_f64 = exact_scores.to(torch.float64)
+    sketched_scores_f64 = sketched_scores.to(torch.float64)
 
-    ratios = torch.zeros_like(exact_scores)
-    ratios[valid_mask] = sketched_scores[valid_mask] / exact_scores[valid_mask]
+    # Use relative threshold based on score magnitude to handle different scales
+    max_score = exact_scores_f64.abs().max()
+    relative_threshold = max(1e-10 * max_score.item(), 1e-12)
+    valid_mask = exact_scores_f64.abs() > relative_threshold
+
+    ratios = torch.zeros_like(exact_scores_f64)
+    ratios[valid_mask] = sketched_scores_f64[valid_mask] / exact_scores_f64[valid_mask]
 
     n_valid = valid_mask.sum().item()
     n_total = len(exact_scores)
@@ -399,28 +379,21 @@ def run_experiment(
                 dtype=torch.float32,
             )
 
-            # For Woodbury (m > n), precompute eigendecomposition once for O(n²) solves
-            precomputed = None
-            if m > n: # Use Woodbury method
-                precomputed = precompute_woodbury(
-                    grad_cache=grad_cache,
-                    projector=projector,
-                    test_vectors=V,
-                    device=device,
-                    batch_size=batch_size,
-                )
+            # Always precompute for Woodbury path (more numerically stable than direct m×m)
+            precomputed = precompute_woodbury(
+                grad_cache=grad_cache,
+                projector=projector,
+                test_vectors=V,
+                device=device,
+                batch_size=batch_size,
+            )
 
-            # Unified loop: compute_sandwich_bounds handles both paths
+            # Compute bounds for each lambda using precomputed Woodbury quantities
             for config in configs:
                 lamb = config["lamb"]
                 bounds = compute_sandwich_bounds(
-                    grad_cache=grad_cache,
-                    projector=projector,
                     lamb=lamb,
-                    test_vectors=test_vectors,
                     exact_scores=exact_scores_by_lambda[lamb],
-                    device=device,
-                    batch_size=batch_size,
                     precomputed=precomputed,
                 )
                 ratios = bounds["ratios"].numpy()
@@ -571,7 +544,7 @@ def main():
         )
 
     # Experiment configuration
-    lambda_values = [1e-4, 1e-3, 1e-2, 1e-1, 1e0, 1e1, 1e2, 1e3]
+    lambda_values = [1e-9, 1e-8, 1e-7, 1e-6, 1e-5, 1e-4, 1e-3]
     m_multipliers = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0]
 
     # Run experiment

@@ -311,11 +311,11 @@ def compute_kernel_from_projected(
 
     for i_start in range(0, n, kernel_batch_size):
         i_end = min(i_start + kernel_batch_size, n)
-        pg_i = PG_cpu[i_start:i_end].to(device)
+        pg_i = PG_cpu[i_start:i_end].to(device=device, dtype=dtype)
 
         for j_start in range(i_start, n, kernel_batch_size):
             j_end = min(j_start + kernel_batch_size, n)
-            pg_j = PG_cpu[j_start:j_end].to(device)
+            pg_j = PG_cpu[j_start:j_end].to(device=device, dtype=dtype)
 
             block = pg_i @ pg_j.T
             K[i_start:i_end, j_start:j_end] = block
