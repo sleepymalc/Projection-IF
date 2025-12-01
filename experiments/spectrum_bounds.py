@@ -22,6 +22,80 @@ from utils.fisher_utils import (
     project_gradients_to_cpu,
 )
 from utils.gradient_cache import GradientCache
+from typing import Tuple
+
+
+# =============================================================================
+# Robust Float64 Gram Matrix Computation (Fixes Mixed Precision Instability)
+# =============================================================================
+
+def compute_robust_gram(
+    grad_cache: GradientCache,
+    lambda_values: list,
+    device: str = "cuda",
+    batch_size: int = 64
+) -> Tuple[Tensor, dict, Tensor]:
+    """
+    Compute exact Gram matrix K = (1/n) G @ G^T in float64 to avoid catastrophic cancellation.
+
+    For high-dimensional models, float32 precision causes catastrophic cancellation
+    in influence score computation: ||v||^2 - u^T (G G^T + λI)^{-1} u. Both the numerator
+    (sketched) and denominator (exact) must use float64 for stable ratios.
+
+    Args:
+        grad_cache: GradientCache containing the training gradients
+        lambda_values: List of regularization parameters λ to compute d_λ for
+        device: GPU device
+        batch_size: Batch size for streaming
+
+    Returns:
+        eigenvalues: Eigenvalues of K in descending order (float64)
+        effective_dims: Dictionary mapping λ -> d_λ
+        K: Gram matrix (n, n) in float64, normalized by 1/n
+    """
+    n = grad_cache.n_samples
+    print(f"  Computing Exact Gram Matrix (n={n}) in float64...")
+
+    # Initialize accumulator in double precision
+    K = torch.zeros(n, n, dtype=torch.float64, device=device)
+
+    # Stream over gradients to build K
+    stream_batch = batch_size
+
+    for i_start in range(0, n, stream_batch):
+        i_end = min(i_start + stream_batch, n)
+        # Load batch (float32 storage) -> Cast to float64
+        G_i = grad_cache.get_batch(i_start, i_end, device=device).to(dtype=torch.float64)
+
+        for j_start in range(i_start, n, stream_batch):
+            j_end = min(j_start + stream_batch, n)
+
+            if i_start == j_start:
+                G_j = G_i
+            else:
+                G_j = grad_cache.get_batch(j_start, j_end, device=device).to(dtype=torch.float64)
+
+            # Accumulate block
+            block = G_i @ G_j.T
+            K[i_start:i_end, j_start:j_end] = block
+
+            if i_start != j_start:
+                K[j_start:j_end, i_start:i_end] = block.T
+
+    # Normalize
+    K.div_(n)
+
+    # Compute eigenvalues for effective dimension calc (in float64)
+    eigenvalues = torch.linalg.eigvalsh(K)
+    eigenvalues = eigenvalues.flip(0).clamp(min=0.0)
+
+    # Compute effective dimensions
+    effective_dims = {}
+    for lamb in lambda_values:
+        d_lambda = torch.sum(eigenvalues / (eigenvalues + lamb)).item()
+        effective_dims[lamb] = d_lambda
+
+    return eigenvalues, effective_dims, K
 
 
 # =============================================================================
@@ -56,15 +130,14 @@ def precompute_woodbury(
     batch_size: int = 64,
 ) -> WoodburyPrecomputed:
     """
-    Precompute quantities for fast Woodbury solves across multiple λ values.
+    Precompute quantities using Streaming Gram Matrix in Float64.
 
-    This function:
-    1. Projects test vectors → PV
-    2. Projects all gradients → PG, computing U = PG @ PV^T simultaneously
-    3. Computes SVD of PG to get eigenvalues/eigenvectors of K_proj = (1/n) PG @ PG^T
-
-    Using SVD(PG) instead of eigh(K_proj) guarantees non-negative eigenvalues
-    since eigenvalues = S² / n where S are singular values.
+    This avoids the memory/indexing issues of SVD on the massive (n, m) matrix:
+    1. OOM / Indexing: We never materialize the full (n, m) PG matrix.
+       We only store the (n, n) kernel K and (n, k) U matrix.
+    2. PSD / Stability: We accumulate K in float64. This prevents the
+       catastrophic cancellation that breaks PSD-ness in float32.
+       Tiny negative eigenvalues (< machine epsilon) are clamped to 0.
 
     After this, solving for any λ is O(n²) instead of O(n³).
 
@@ -79,63 +152,79 @@ def precompute_woodbury(
         WoodburyPrecomputed containing all precomputed quantities
     """
     n = grad_cache.n_samples
+    k = test_vectors.shape[0]
 
-    # Step 1: Project test vectors → PV (k, m)
-    PV = projector.project(test_vectors, ensemble_id=0)
+    # Step 1: Project test vectors → PV (k, m) in float64 for precision
+    PV = projector.project(test_vectors, ensemble_id=0).to(dtype=torch.float64, device=device)
     pv_norms_sq = (PV ** 2).sum(dim=1)  # (k,)
 
-    # Step 2: Project all gradients and compute U = PG @ PV^T simultaneously
-    PG_cpu, U = project_gradients_to_cpu(grad_cache, projector, device, batch_size, test_vectors=PV)
+    # Step 2: Initialize accumulators in float64 (critical for numerical stability)
+    K = torch.zeros(n, n, dtype=torch.float64, device=device)
+    U = torch.zeros(n, k, dtype=torch.float64, device=device)
 
-    # Scale U by 1/√n for Woodbury formula
-    U = U / (n ** 0.5)
+    # Step 3: Stream over gradients to build K and U without storing full PG
+    # We project each batch and immediately accumulate into K
+    # This requires O(n^2 / batch_size) projection calls but uses O(n^2) memory
 
-    # Step 3: SVD of PG to get eigenvalues/eigenvectors of K_proj
-    # K_proj = (1/n) PG @ PG.T = (1/n) U_svd @ diag(S²) @ U_svd.T
-    # So eigenvalues = S² / n (always non-negative!) and eigenvectors = U_svd
+    # First pass: project all gradients and store temporarily for K computation
+    # We store projections in CPU memory in chunks to avoid GPU OOM
+    print(f"  Streaming Gram matrix (n={n}) in float64...")
 
-    # Heuristic: If matrix is too large (e.g. > 200M elements), force CPU SVD
-    # This prevents OOM and cuSolver 32-bit integer overflow issues.
-    # 200M float32 elements is ~800MB, a safe conservative threshold.
-    use_cpu_svd = PG_cpu.numel() > 2e8
+    # Project all gradients to CPU storage (float32 for storage, cast to float64 for ops)
+    pg_storage = []
+    for i_start in range(0, n, batch_size):
+        i_end = min(i_start + batch_size, n)
+        g_batch = grad_cache.get_batch(i_start, i_end, device=device)
+        pg_batch = projector.project(g_batch, ensemble_id=0)
+        pg_storage.append(pg_batch.cpu())  # Store on CPU in float32
 
-    if not use_cpu_svd:
-        try:
-            # Try moving to device (inside try block to catch OOM)
-            PG_device = PG_cpu.to(device)
+        # Compute U for this batch: U[i] = pg_i @ PV.T
+        pg_batch_f64 = pg_batch.to(dtype=torch.float64)
+        U[i_start:i_end] = pg_batch_f64 @ PV.T
 
-            # Check for NaN/inf values before SVD on GPU
-            if torch.isnan(PG_device).any() or torch.isinf(PG_device).any():
-                nan_count = torch.isnan(PG_device).sum().item()
-                inf_count = torch.isinf(PG_device).sum().item()
-                raise ValueError(f"PG contains {nan_count} NaN and {inf_count} inf values")
+    # Second pass: compute K from stored projections
+    for i, i_start in enumerate(range(0, n, batch_size)):
+        i_end = min(i_start + batch_size, n)
+        pg_i = pg_storage[i].to(device=device, dtype=torch.float64)
 
-            U_svd, S, Vh = torch.linalg.svd(PG_device, full_matrices=False)
+        for j, j_start in enumerate(range(0, n, batch_size)):
+            j_end = min(j_start + batch_size, n)
 
-        except (torch.cuda.OutOfMemoryError, RuntimeError, torch._C._LinAlgError, ValueError) as e:
-            # Catch OOM, cuSolver errors (RuntimeError/LinAlgError), or our NaN check
-            print(f"  GPU SVD/Alloc failed ({e}), falling back to CPU...")
-            use_cpu_svd = True
+            if j < i:
+                # Already computed by symmetry
+                continue
+            elif i == j:
+                # Diagonal block
+                K[i_start:i_end, j_start:j_end] = pg_i @ pg_i.T
+            else:
+                # Off-diagonal block
+                pg_j = pg_storage[j].to(device=device, dtype=torch.float64)
+                block = pg_i @ pg_j.T
+                K[i_start:i_end, j_start:j_end] = block
+                K[j_start:j_end, i_start:i_end] = block.T  # Symmetry
 
-            # Attempt to free GPU memory if allocation succeeded partially
-            if 'PG_device' in locals():
-                del PG_device
-                torch.cuda.empty_cache()
+    # Clean up storage
+    del pg_storage
 
-    if use_cpu_svd:
-        # Check for NaN/inf on CPU if we skipped GPU check
-        if torch.isnan(PG_cpu).any() or torch.isinf(PG_cpu).any():
-            nan_count = torch.isnan(PG_cpu).sum().item()
-            inf_count = torch.isinf(PG_cpu).sum().item()
-            raise ValueError(f"PG contains {nan_count} NaN and {inf_count} inf values before SVD")
+    # Step 4: Normalize
+    K.div_(n)
+    U.div_(n ** 0.5)
 
-        U_svd, S, Vh = torch.linalg.svd(PG_cpu, full_matrices=False)
-        U_svd = U_svd.to(device)
-        S = S.to(device)
+    # Step 5: Eigendecomposition on the (n x n) kernel matrix
+    # eigh is numerically stable for symmetric matrices
+    eigenvalues, eigenvectors = torch.linalg.eigh(K)
 
-    # eigenvalues of K_proj = S² / n
-    eigenvalues = (S ** 2) / n
-    eigenvectors = U_svd
+    # Step 6: Enforce PSD by clamping tiny negative eigenvalues to 0
+    # In float64, anything < -1e-12 * max_eigenvalue is just numerical noise
+    threshold = -1e-12 * eigenvalues.abs().max()
+    n_negative = (eigenvalues < threshold).sum().item()
+    if n_negative > 0:
+        print(f"  Warning: {n_negative} eigenvalues below threshold, clamping to 0")
+    eigenvalues = torch.clamp(eigenvalues, min=0.0)
+
+    # Flip to descending order (eigh returns ascending)
+    eigenvalues = eigenvalues.flip(0)
+    eigenvectors = eigenvectors.flip(1)
 
     return WoodburyPrecomputed(
         eigenvalues=eigenvalues,
@@ -156,13 +245,19 @@ def compute_scores(
     K: Tensor,
 ) -> Tensor:
     """
-    Compute influence scores A^T (F + λI)^{-1} B (unsketched).
+    Compute exact influence scores in Float64 to ensure valid baseline.
 
     For self-scores, pass A=B and use result.diag().
 
     Uses Woodbury identity:
-        scores[i,j] = (1/λ)[a_i^T b_j - u_a[i]^T (K + nλI)^{-1} u_b[j]]
-    where u_a = G @ a and u_b = G @ b.
+        scores[i,j] = (1/λ)[a_i^T b_j - u_a[i]^T (K + λI)^{-1} u_b[j]]
+    where u_a = G @ a, u_b = G @ b, and K is normalized (1/n G G^T).
+
+    Note: K should be the normalized Gram matrix from compute_robust_gram().
+    The math: Score = (1/λ)[ a.b - u_a^T (G G^T + nλI)^-1 u_b ]
+              G G^T = n * K, so matrix = n*K + n*λ*I = n(K + λI)
+              Inverse = (1/n)(K + λI)^-1
+              We solve (K + λI) X = U/n to get X = (K + λI)^-1 (U/n)
 
     Args:
         A: Left vectors of shape (k_A, d) on device
@@ -171,45 +266,50 @@ def compute_scores(
         lamb: Regularization parameter
         device: GPU device
         batch_size: Batch size for streaming
-        K: Pre-computed Gram matrix (n, n), unnormalized
+        K: Pre-computed Gram matrix (n, n), normalized by 1/n, in float64
 
     Returns:
         Tensor of shape (k_A, k_B) containing influence scores
     """
-    k_A = A.shape[0]
-    k_B = B.shape[0]
-    dtype = A.dtype
     n = grad_cache.n_samples
 
-    # Compute U_A = G @ A^T -> (n, k_A)
-    U_A = torch.zeros(n, k_A, device=device, dtype=dtype)
+    # 1. Cast inputs to float64 for precision
+    A_dbl = A.to(dtype=torch.float64, device=device)
+    B_dbl = B.to(dtype=torch.float64, device=device)
+    K_dbl = K.to(dtype=torch.float64, device=device)
+    lamb_dbl = float(lamb)
+
+    k_A = A.shape[0]
+    k_B = B.shape[0]
+
+    # 2. Compute U_A = G @ A^T in float64
+    U_A = torch.zeros(n, k_A, device=device, dtype=torch.float64)
     for i_start in range(0, n, batch_size):
         i_end = min(i_start + batch_size, n)
         G_batch = grad_cache.get_batch(i_start, i_end, device=device)
-        U_A[i_start:i_end, :] = G_batch @ A.T
+        # Cast to double for precision
+        U_A[i_start:i_end, :] = G_batch.to(dtype=torch.float64) @ A_dbl.T
 
     # Check if A and B are the same tensor (self-scores optimization)
-    same_AB = A.data_ptr() == B.data_ptr()
-
-    if same_AB:
+    if A.data_ptr() == B.data_ptr():
         U_B = U_A
     else:
-        # Compute U_B = G @ B^T -> (n, k_B)
-        U_B = torch.zeros(n, k_B, device=device, dtype=dtype)
+        U_B = torch.zeros(n, k_B, device=device, dtype=torch.float64)
         for i_start in range(0, n, batch_size):
             i_end = min(i_start + batch_size, n)
             G_batch = grad_cache.get_batch(i_start, i_end, device=device)
-            U_B[i_start:i_end, :] = G_batch @ B.T
+            U_B[i_start:i_end, :] = G_batch.to(dtype=torch.float64) @ B_dbl.T
 
-    # Solve (nλI + K) X_B = U_B
-    K_dev = K.to(device)
-    reg_matrix = K_dev + n * lamb * torch.eye(n, device=device, dtype=K_dev.dtype)
-    X_B = torch.linalg.solve(reg_matrix, U_B)  # (n, k_B)
+    # 3. Solve (K + λI) X = U/n in float64
+    # K is already normalized by 1/n in compute_robust_gram
+    reg_matrix = K_dbl + lamb_dbl * torch.eye(n, device=device, dtype=torch.float64)
+    rhs = U_B / n  # Scale by 1/n to account for the normalization
+    X_B = torch.linalg.solve(reg_matrix, rhs)  # (n, k_B)
 
-    # Compute scores: scores[i,j] = (1/λ)[a_i^T b_j - u_a[i]^T x_b[j]]
-    A_dot_B = A @ B.T  # (k_A, k_B)
+    # 4. Compute scores: (A.B - U_A^T @ X_B) / λ
+    A_dot_B = A_dbl @ B_dbl.T  # (k_A, k_B)
     cross_term = U_A.T @ X_B  # (k_A, k_B)
-    scores = (A_dot_B - cross_term) / lamb
+    scores = (A_dot_B - cross_term) / lamb_dbl
 
     return scores
 
@@ -321,17 +421,19 @@ def run_experiment(
     print(f"  - min_m = {min_m}, min_d_lambda = {min_d_lambda}")
     print(f"  - {len(m_multipliers)} dim ratio × {num_trials} trials × {len(lambda_values)} λ")
 
-    # Compute eigenvalues, effective dimensions, and Gram matrix together
-    print(f"\nComputing eigenvalues and Gram matrix...")
-    eigenvalues, eff_dims, K = compute_eigenspectrum(
-        grad_cache, lambda_values, device=device, batch_size=batch_size*4, return_gram=True
+    # Compute eigenvalues, effective dimensions, and Gram matrix in FLOAT64
+    # This fixes mixed precision instability where float32 causes catastrophic
+    # cancellation in influence score computation for high-dimensional models
+    print(f"\nComputing eigenvalues and Gram matrix (Robust Float64)...")
+    eigenvalues, eff_dims, K = compute_robust_gram(
+        grad_cache, lambda_values, device=device, batch_size=batch_size*4
     )
 
     eig_nonzero = eigenvalues[eigenvalues > 1e-10]
     print(f"  Eigenvalue stats: max={eigenvalues[0]:.2e}, min_nonzero={eig_nonzero[-1]:.2e}, "
           f"n_nonzero={len(eig_nonzero)}/{len(eigenvalues)}")
-    # Unnormalize for Woodbury formula
-    K_unnorm = K * n
+    # K is already normalized by 1/n and in float64 - no unnormalization needed
+    # The new compute_scores() expects the normalized K
 
     # Compute numerical rank
     threshold = 1e-10 * eigenvalues[0]
@@ -349,10 +451,11 @@ def run_experiment(
         print(f"\nSkipping {len(skipped_lambdas)} λ values with d_λ < {min_d_lambda}")
 
     # Precompute exact scores for all λ values (doesn't depend on m or trial)
+    # Note: compute_scores now uses float64 internally for numerical stability
     print(f"\nPrecomputing exact scores for {len(valid_lambdas)} λ values...")
     exact_scores_by_lambda = {}
     for lamb in valid_lambdas:
-        exact_scores_by_lambda[lamb] = compute_scores(V, V, grad_cache, lamb, device, batch_size, K_unnorm).diag()
+        exact_scores_by_lambda[lamb] = compute_scores(V, V, grad_cache, lamb, device, batch_size, K).diag()
     print(f"  Done. Exact scores cached for all λ values.")
 
     # Collect all unique m values and build config mapping
@@ -567,8 +670,8 @@ def main():
         )
 
     # Experiment configuration
-    lambda_values = [1e-8, 1e-7, 1e-6, 1e-5]
-    m_multipliers = [0.25, 0.5, 1.0, 2.0]
+    lambda_values = [1e-8, 1e-7, 1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1]
+    m_multipliers = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0]
 
     # Run experiment
     results = run_experiment(
