@@ -61,4 +61,4 @@ dist
 *.json
 
 /test/
-/Figures/
+*/results/*
