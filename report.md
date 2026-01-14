@@ -1,17 +1,26 @@
 # Projection-Regularization for Data Attribution at Scale
 
-Main theorem: the sketched scores $\widetilde{\phi}_{\lambda}(g_i, g_{\text{test}})$ approximate the exact scores $\phi_{\lambda}(g_i, g_{\text{test}})$ within $(1±\epsilon)$-bounds, where
+**Main Theorem.** Let $P \in \mathbb{R}^{m \times d}$ be a sketching matrix whose rows are i.i.d. sub-Gaussian random vectors. For any $\epsilon, \delta \in (0,1)$, if the sketch size satisfies
 $$
-\phi_{\lambda}(g_i, g_{\text{test}})
-= g_i^{\top} (F+\lambda I)^{-1} g_{\text{test}},\quad
-\widetilde{\phi}_{\lambda}(g_i, g_{\text{test}})
-= (Pg_i)^{\top} (PFP^{\top} +\lambda I)^{-1} (Pg_{\text{test}}),
+m = \Omega\left(\epsilon^{-2}(d_\lambda(F) + \log(1/\delta))\right),
 $$
-given that $P\in \mathbb{R}^{m \times k}$ is a standard oblivious sketch with $m = \widetilde{\Omega}(d_{\lambda}(F) / \epsilon^2)$.
+then with probability at least $1-\delta$, the following bounds hold for all $g, g' \in \operatorname{range}(F)$:
+
+1. **Self-influence bound (Eq. 1)**:
+$$
+|\widetilde{\phi}_\lambda(g) - \phi_\lambda(g)| \leq \epsilon \cdot \phi(g)
+$$
+
+2. **Bilinear form bound (Eq. 2)**:
+$$
+|\widetilde{B}_\lambda(g, g') - B_\lambda(g, g')| \leq \epsilon \sqrt{\phi_\lambda(g)} \sqrt{\phi_\lambda(g')}
+$$
+
+Here, $\phi_\lambda(g) := g^\top(F+\lambda I)^{-1}g$ and $\widetilde{\phi}_\lambda(g) := (Pg)^\top(PFP^\top + \lambda I)^{-1}(Pg)$, with $B_\lambda$ and $\widetilde{B}_\lambda$ denoting the corresponding bilinear forms. The effective dimension is $d_\lambda(F) = \mathrm{tr}(F(F+\lambda I)^{-1})$.
 
 >[!Note]
 >
->**Theorem 2** only guarantees $\widetilde{\phi}_{\lambda}(g_i, g_{\text{test}}) \in (1\pm \epsilon) \phi_{\lambda}(g_i, g_{\text{test}})$ for $g_{\text{test}} \in \operatorname{range}(F)$. In reality, this is rarely the case.
+>The theorem only guarantees bounds for $g, g' \in \operatorname{range}(F)$. For test gradients $g' \notin \operatorname{range}(F)$, Section 3 of the theoretical document provides leakage analysis showing that the approximation error for the kernel component decays at rate $O(m^{-1/2})$.
 
 ## Experiments
 
@@ -25,29 +34,29 @@ Due to the scale, we utilize SJLT (sparse Johnson-Lindenstrauss transform).
 
 ### Spectrum Bounds Validation
 
-We first investigate the spectrum sandwich bound. The experimental procedure is:
+We validate the theoretical bounds from the Main Theorem. The experimental procedure is:
 
-1. Compute the empirical Fisher matrix $F = \frac{1}{n}\sum_{i=1}^{n} g_i g_i^{\top}$ and its eigenspectrum
-2. For each $\lambda \in \{10^{-3}, 10^{-2}, 10^{-1}, 1, 10, 100, 1000\}$, compute $d_{\lambda}(F) = \mathrm{tr}(F(F+\lambda I)^{-1})$
-3. For each $(m, \lambda)$ pair, compute both exact scores $\phi_{\lambda}$ and sketched scores $\widetilde{\phi}_{\lambda}$
-4. Measure the empirical approximation error $\epsilon = |\widetilde{\phi}_{\lambda} / \phi_{\lambda} - 1|$
+1. Compute the empirical Fisher matrix $F = \sum_{i=1}^{n} g_i g_i^{\top}$ and its eigenspectrum
+2. For each $\lambda$, compute $d_{\lambda}(F) = \mathrm{tr}(F(F+\lambda I)^{-1})$
+3. For each $(m, \lambda)$ pair, compute both exact and sketched scores
+4. Measure the empirical approximation error (metric depends on test mode)
 
 #### Test Gradient Selection
 
-The experiment supports two modes for selecting test gradients:
+The experiment supports two modes:
 
-- **Self-influence mode** (`--test_mode self`): Uses training gradients as test vectors, computing diagonal self-scores $\phi_\lambda(g_i, g_i)$. Error is aggregated over $k$ self-scores.
+- **Self-influence mode** (`--test_mode self`): Validates Eq. 1 using training gradients as test vectors, computing diagonal self-scores $\phi_\lambda(g_i, g_i)$. Error metric: $|\widetilde{\phi}_\lambda - \phi_\lambda| / \phi_\lambda$ (ratio deviation).
 
-- **Held-out mode** (`--test_mode held_out`): Uses held-out test set gradients, computing the full cross-score matrix $\phi_\lambda(g_{\text{train}}, g_{\text{test}})$ of shape $(n_{\text{train}}, k_{\text{test}})$. Error is aggregated over all $n \times k$ scores, giving the worst-case error across all (train, test) pairs.
+- **Test mode** (`--test_mode test`): Validates Eq. 2 using held-out test set gradients, computing the full cross-score matrix $B_\lambda(g_{\text{train}}, g_{\text{test}})$ of shape $(n_{\text{train}}, k_{\text{test}})$. Error metric: $|\widetilde{B}_\lambda - B_\lambda| / (\sqrt{\phi_\lambda(g)} \cdot \sqrt{\phi_\lambda(v)})$ (normalized bilinear form error).
 
-For held-out mode, this provides a more realistic evaluation since in practice we compute influence of training samples on test samples.
+We plot the following (2x2 layout):
 
-We plot the following:
+1. **Self-Influence Error (Top-Left)**: $m/d_\lambda$ vs. $|\widetilde{\phi}_\lambda/\phi_\lambda - 1|$ (95th percentile). Validates Eq. 1.
+2. **Bilinear Form Error (Top-Right)**: $m/d_\lambda$ vs. normalized error $|\widetilde{B}_\lambda (g, g')-B_\lambda (g, g')|/(\sqrt{\phi_\lambda(g)}\sqrt{\phi_\lambda(g')})$ (95th percentile). Validates Eq. 2.
+3. **Eigenvalue Spectrum (Bottom-Left)**: Shows eigenvalue decay of $F$, which determines $d_\lambda$ for different $\lambda$.
+4. **Compression Ratio (Bottom-Right)**: $\lambda$ vs. $d_\lambda / \operatorname{rank}(F)$, showing how regularization compresses the effective dimension.
 
-1. **$m / d_{\lambda}$ vs. $\epsilon$**: We expect this to follow a straight line with slope $-1/2$ in log-log plot, validating $\epsilon \propto 1/\sqrt{m/d_{\lambda}}$.
-2. **$m/d_{\lambda}$ vs. $\widetilde{\phi}_{\lambda} / \phi_{\lambda}$**: As $m/d_{\lambda}$ grows, the ratio should converge to $1$.
-3. **Spectrum of $F$**: Shows eigenvalue decay, which determines $d_{\lambda}$ for different $\lambda$.
-4. **$\lambda$ vs. $d_{\lambda} / \operatorname{rank}(F)$**: Measures how fast $d_{\lambda}$ shrinks as $\lambda$ grows (compression ratio).
+Both error plots should follow $\epsilon \propto 1/\sqrt{m/d_\lambda}$ (slope $-1/2$ in log-log scale).
 
 #### MNIST+Logistic Regression
 
