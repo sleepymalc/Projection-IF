@@ -63,21 +63,21 @@ Both error plots should follow $\epsilon \propto 1/\sqrt{m/d_\lambda}$ (slope $-
 - Parameters: 7,850, Rank: 4,525
 - Effective dimensions: $d_{0.1} = 704$, $d_{1} = 199$, $d_{10} = 40$
 
-![Spectrum Bounds - MNIST LR](experiments/results/figures/spectrum_bounds/spectrum_mnist_lr.png)
+![Spectrum Bounds - MNIST LR](experiments/figures/spectrum_bounds/spectrum_mnist_lr.png)
 
 #### MNIST+MLP
 
 - Parameters: 109,386, Rank: 5,000
 - Effective dimensions: $d_{0.01} = 815$, $d_{0.1} = 160$, $d_{1} = 24$
 
-![Spectrum Bounds - MNIST MLP](experiments/results/figures/spectrum_bounds/spectrum_mnist_mlp.png)
+![Spectrum Bounds - MNIST MLP](experiments/figures/spectrum_bounds/spectrum_mnist_mlp.png)
 
 #### CIFAR2+ResNet9
 
 - Parameters: 4,825,154, Rank: 4,560
 - Effective dimensions: $d_{0.001} = 34$, $d_{0.01} = 16$, $d_{0.1} = 5$
 
-![Spectrum Bounds - CIFAR2 ResNet9](experiments/results/figures/spectrum_bounds/spectrum_cifar2_resnet9.png)
+![Spectrum Bounds - CIFAR2 ResNet9](experiments/figures/spectrum_bounds/spectrum_cifar2_resnet9.png)
 
 ### Hyperparameter Selection
 
@@ -101,7 +101,7 @@ We plot the following:
 - Val LDS = 0.360, Test LDS = 0.380
 - **Empirical constant**: $c_{95\%} = 4096 / 200 = 20.5$
 
-![Hyperparam Selection - MNIST LR](experiments/results/figures/hyperparam_selection/hyperparam_mnist_lr.png)
+![Hyperparam Selection - MNIST LR](experiments/figures/hyperparam_selection/hyperparam_mnist_lr.png)
 
 #### MNIST+MLP
 
@@ -109,7 +109,7 @@ We plot the following:
 - Val LDS = 0.187, Test LDS = 0.181
 - **Empirical constant**: $c_{95\%} = 8192 / 742 = 11.0$
 
-![Hyperparam Selection - MNIST MLP](experiments/results/figures/hyperparam_selection/hyperparam_mnist_mlp.png)
+![Hyperparam Selection - MNIST MLP](experiments/figures/hyperparam_selection/hyperparam_mnist_mlp.png)
 
 #### CIFAR2+ResNet9
 
@@ -117,7 +117,7 @@ We plot the following:
 - Val LDS = 0.185, Test LDS = 0.187
 - **Empirical constant**: $c_{95\%} = 2048 / 277 = 7.4$
 
-![Hyperparam Selection - CIFAR2 ResNet9](experiments/results/figures/hyperparam_selection/hyperparam_cifar2_resnet9.png)
+![Hyperparam Selection - CIFAR2 ResNet9](experiments/figures/hyperparam_selection/hyperparam_cifar2_resnet9.png)
 
 #### Summary: Practical Rule for Choosing $m$
 

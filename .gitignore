@@ -38,7 +38,7 @@ dist
 *.pt
 *.slurm
 *.arrow
-# *.png
+*.png
 *.pdf
 *.tex
 *.nfs*
