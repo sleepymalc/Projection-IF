@@ -26,6 +26,31 @@ from typing import Tuple
 
 
 # =============================================================================
+# Safe Projection Helper
+# =============================================================================
+
+def safe_project(data: Tensor, projector, d: int, ensemble_id: int = 0) -> Tensor:
+    """
+    Safely project data, using identity (no projection) when m >= d.
+
+    Args:
+        data: Input tensor of shape (batch, d)
+        projector: Projector with .project() method and .proj_dim attribute
+        d: Original dimension
+        ensemble_id: Ensemble ID for projection
+
+    Returns:
+        Projected tensor of shape (batch, m) if m < d, else original tensor
+    """
+    m = projector.proj_dim
+    if m >= d:
+        # No projection needed when target dimension >= source dimension
+        return data
+    else:
+        return projector.project(data, ensemble_id=ensemble_id)
+
+
+# =============================================================================
 # Robust Float64 Gram Matrix Computation (Fixes Mixed Precision Instability)
 # =============================================================================
 
@@ -33,8 +58,9 @@ def compute_robust_gram(
     grad_cache: GradientCache,
     lambda_values: list,
     device: str = "cuda",
-    batch_size: int = 64
-) -> Tuple[Tensor, dict, Tensor]:
+    batch_size: int = 64,
+    return_eigenvectors: bool = False,
+) -> Tuple[Tensor, dict, Tensor, Tensor]:
     """
     Compute exact Gram matrix K = (1/n) G @ G^T in float64 to avoid catastrophic cancellation.
 
@@ -47,11 +73,13 @@ def compute_robust_gram(
         lambda_values: List of regularization parameters λ to compute d_λ for
         device: GPU device
         batch_size: Batch size for streaming
+        return_eigenvectors: If True, compute and return eigenvectors for φ₀ computation
 
     Returns:
         eigenvalues: Eigenvalues of K in descending order (float64)
         effective_dims: Dictionary mapping λ -> d_λ
         K: Gram matrix (n, n) in float64, normalized by 1/n
+        eigenvectors: Eigenvectors of K (n, n) in descending order (None if return_eigenvectors=False)
     """
     n = grad_cache.n_samples
     print(f"  Computing Exact Gram Matrix (n={n}) in float64...")
@@ -85,9 +113,15 @@ def compute_robust_gram(
     # Normalize
     K.div_(n)
 
-    # Compute eigenvalues for effective dimension calc (in float64)
-    eigenvalues = torch.linalg.eigvalsh(K)
-    eigenvalues = eigenvalues.flip(0).clamp(min=0.0)
+    # Compute eigendecomposition (in float64)
+    if return_eigenvectors:
+        eigenvalues, eigenvectors = torch.linalg.eigh(K)
+        eigenvalues = eigenvalues.flip(0).clamp(min=0.0)
+        eigenvectors = eigenvectors.flip(1)
+    else:
+        eigenvalues = torch.linalg.eigvalsh(K)
+        eigenvalues = eigenvalues.flip(0).clamp(min=0.0)
+        eigenvectors = None
 
     # Compute effective dimensions
     effective_dims = {}
@@ -95,7 +129,72 @@ def compute_robust_gram(
         d_lambda = torch.sum(eigenvalues / (eigenvalues + lamb)).item()
         effective_dims[lamb] = d_lambda
 
-    return eigenvalues, effective_dims, K
+    return eigenvalues, effective_dims, K, eigenvectors
+
+
+def compute_unregularized_self_influence(
+    eigenvalues: Tensor,
+    eigenvectors: Tensor,
+    U_test: Tensor = None,
+    n: int = None,
+    eps: float = 1e-10,
+) -> Tuple[Tensor, Tensor]:
+    """
+    Compute unregularized self-influence φ₀(g) = g^T F^† g for training and test samples.
+
+    For training gradients g_i (rows of G):
+        φ₀(g_i) = n × Σ_{j: λ_j > ε} Q[i,j]²
+
+    For test gradients v:
+        w = G @ v (projection into Gram space)
+        φ₀(v) = (1/n) × ||K^† w||² = (1/n) × Σ_{j: λ_j > ε} (Q^T w)_j² / λ_j²
+
+    Args:
+        eigenvalues: Eigenvalues of K in descending order (n,)
+        eigenvectors: Eigenvectors of K, columns in descending order (n, n)
+        U_test: G @ V^T for test gradients V, shape (n, k). If None, only train φ₀ is computed.
+        n: Number of training samples (for normalization)
+        eps: Threshold for non-zero eigenvalues (relative to max eigenvalue)
+
+    Returns:
+        train_phi0: φ₀ for training samples, shape (n,)
+        test_phi0: φ₀ for test samples, shape (k,), or None if U_test is None
+    """
+    if n is None:
+        n = eigenvalues.shape[0]
+
+    # Determine non-zero eigenvalues (relative threshold)
+    threshold = eps * eigenvalues[0].item() if eigenvalues[0] > 0 else eps
+    nonzero_mask = eigenvalues > threshold
+    n_nonzero = nonzero_mask.sum().item()
+
+    print(f"  φ₀ computation: {n_nonzero}/{len(eigenvalues)} non-zero eigenvalues (threshold={threshold:.2e})")
+
+    # Training samples: φ₀(g_i) = n × Σ_{j: λ_j > ε} Q[i,j]²
+    # This uses the fact that g_i is the i-th row of G, so u_i = G @ g_i = n * K[:, i]
+    # and K^† K is the projection onto the range of K
+    Q_nonzero = eigenvectors[:, nonzero_mask]  # (n, r) where r = n_nonzero
+    train_phi0 = n * (Q_nonzero ** 2).sum(dim=1)  # (n,)
+
+    # Test samples: φ₀(v_j) = (1/n) × ||K^† w_j||²
+    # where w_j = G @ v_j = U_test[:, j]
+    # K^† w = Q Λ^† Q^T w, so ||K^† w||² = Σ_j (Q^T w)_j² / λ_j² for non-zero λ
+    if U_test is not None:
+        # Project U_test onto eigenbasis: Z = Q^T @ U_test, shape (n, k)
+        Z = eigenvectors.T @ U_test  # (n, k)
+
+        # For non-zero eigenvalues, compute (z / λ)² and sum
+        # Z_nonzero = Z[nonzero_mask, :]  # (r, k)
+        # lambda_nonzero = eigenvalues[nonzero_mask]  # (r,)
+        inv_lambda_sq = torch.zeros_like(eigenvalues)
+        inv_lambda_sq[nonzero_mask] = 1.0 / (eigenvalues[nonzero_mask] ** 2)
+
+        # ||K^† w_j||² = Σ_i (Z[i,j] / λ_i)² for non-zero λ
+        test_phi0 = (1.0 / n) * (inv_lambda_sq.unsqueeze(1) * (Z ** 2)).sum(dim=0)  # (k,)
+    else:
+        test_phi0 = None
+
+    return train_phi0, test_phi0
 
 
 # =============================================================================
@@ -159,9 +258,18 @@ def precompute_woodbury(
     """
     n = grad_cache.n_samples
     k = test_vectors.shape[0]
+    d = grad_cache.dim
 
     # Step 1: Project test vectors → PV (k, m) in float64 for precision
-    PV = projector.project(test_vectors, ensemble_id=0).to(dtype=torch.float64, device=device)
+    # Use safe_project to handle m >= d case (identity projection)
+    # Project in batches to avoid OOM on large test sets
+    pv_batches = []
+    for i_start in range(0, k, batch_size):
+        i_end = min(i_start + batch_size, k)
+        test_batch = test_vectors[i_start:i_end]
+        pv_batch = safe_project(test_batch, projector, d, ensemble_id=0).to(dtype=torch.float64, device=device)
+        pv_batches.append(pv_batch)
+    PV = torch.cat(pv_batches, dim=0)
     pv_norms_sq = (PV ** 2).sum(dim=1)  # (k,)
 
     # Step 2: Initialize accumulators in float64 (critical for numerical stability)
@@ -181,12 +289,17 @@ def precompute_woodbury(
     for i_start in range(0, n, batch_size):
         i_end = min(i_start + batch_size, n)
         g_batch = grad_cache.get_batch(i_start, i_end, device=device)
-        pg_batch = projector.project(g_batch, ensemble_id=0)
+        pg_batch = safe_project(g_batch, projector, d, ensemble_id=0)
         pg_storage.append(pg_batch.cpu())  # Store on CPU in float32
 
         # Compute U for this batch: U[i] = pg_i @ PV.T
         pg_batch_f64 = pg_batch.to(dtype=torch.float64)
         U[i_start:i_end] = pg_batch_f64 @ PV.T
+        del pg_batch, pg_batch_f64
+
+    # Clean up PV to free GPU memory
+    del PV
+    torch.cuda.empty_cache()
 
     # Second pass: compute K from stored projections
     for i, i_start in enumerate(range(0, n, batch_size)):
@@ -208,9 +321,13 @@ def precompute_woodbury(
                 block = pg_i @ pg_j.T
                 K[i_start:i_end, j_start:j_end] = block
                 K[j_start:j_end, i_start:i_end] = block.T  # Symmetry
+                del pg_j
+
+        del pg_i
 
     # Clean up storage
     del pg_storage
+    torch.cuda.empty_cache()
 
     # Step 4: Normalize
     K.div_(n)
@@ -330,8 +447,8 @@ def compute_sandwich_bounds(
     exact_scores: Tensor,
     precomputed: WoodburyPrecomputed,
     test_mode: str = "self",
-    train_self_scores: Tensor = None,
-    test_self_scores: Tensor = None,
+    train_phi0: Tensor = None,
+    test_phi0: Tensor = None,
 ) -> dict:
     """
     Compute sandwich bounds for sketched inverse approximation quality.
@@ -342,16 +459,17 @@ def compute_sandwich_bounds(
     - "self": Self-influence scores. exact_scores is (k,), returns diagonal scores.
               Error metric: ratio = sketched/exact (should be ≈1)
     - "test": Cross-scores with test gradients. exact_scores is (n, k), returns full (n, k) matrix.
-              Error metric: normalized additive error |sketched - exact| / (sqrt(φ_λ(g)) * sqrt(φ_λ(v)))
-              Based on Theorem 1 Eq (2): |B̃_λ(g,g') - B_λ(g,g')| ≤ ε * sqrt(φ_λ(g)) * sqrt(φ_λ(g'))
+              Error metric: normalized additive error |sketched - exact| / (sqrt(φ₀(g)) * sqrt(φ₀(v)))
+              Based on Theorem 1 Eq (2): |B̃_λ(g,g') - B_λ(g,g')| ≤ ε * sqrt(φ₀(g)) * sqrt(φ₀(g'))
+              where φ₀ is the unregularized self-influence (using F^† instead of (F+λI)^{-1}).
 
     Args:
         lamb: Regularization parameter λ
         exact_scores: Pre-computed exact scores. Shape (k,) for self, (n, k) for test mode.
         precomputed: WoodburyPrecomputed from precompute_woodbury()
         test_mode: "self" or "test"
-        train_self_scores: Self-influence scores φ_λ(g_i) for training samples (required for test mode)
-        test_self_scores: Self-influence scores φ_λ(v_j) for test samples (required for test mode)
+        train_phi0: Unregularized self-influence φ₀(g_i) for training samples (required for test mode)
+        test_phi0: Unregularized self-influence φ₀(v_j) for test samples (required for test mode)
 
     Returns:
         Dictionary with exact_scores, sketched_scores, error metrics, and statistics
@@ -439,18 +557,19 @@ def compute_sandwich_bounds(
         }
     else:
         # Test mode: use normalized additive error metric
-        # Based on Theorem 1 Eq (2): |B̃_λ(g,g') - B_λ(g,g')| ≤ ε * sqrt(φ_λ(g)) * sqrt(φ_λ(g'))
-        # So: ε = |B̃ - B| / (sqrt(φ_λ(g)) * sqrt(φ_λ(v)))
-        if train_self_scores is None or test_self_scores is None:
-            raise ValueError("train_self_scores and test_self_scores are required for test mode")
+        # Based on Theorem 1 Eq (2): |B̃_λ(g,g') - B_λ(g,g')| ≤ ε * sqrt(φ₀(g)) * sqrt(φ₀(g'))
+        # So: ε = |B̃ - B| / (sqrt(φ₀(g)) * sqrt(φ₀(v)))
+        # where φ₀ is the unregularized self-influence (using F^† instead of (F+λI)^{-1})
+        if train_phi0 is None or test_phi0 is None:
+            raise ValueError("train_phi0 and test_phi0 are required for test mode")
 
-        train_self_f64 = train_self_scores.to(torch.float64).cpu()  # (n,)
-        test_self_f64 = test_self_scores.to(torch.float64).cpu()    # (k,)
+        train_phi0_f64 = train_phi0.to(torch.float64).cpu()  # (n,)
+        test_phi0_f64 = test_phi0.to(torch.float64).cpu()    # (k,)
 
-        # Compute normalizer: sqrt(φ_λ(g_i)) * sqrt(φ_λ(v_j)) for each (i, j) pair
+        # Compute normalizer: sqrt(φ₀(g_i)) * sqrt(φ₀(v_j)) for each (i, j) pair
         # Shape: (n, k)
-        sqrt_train = torch.sqrt(torch.clamp(train_self_f64, min=1e-12)).unsqueeze(1)  # (n, 1)
-        sqrt_test = torch.sqrt(torch.clamp(test_self_f64, min=1e-12)).unsqueeze(0)    # (1, k)
+        sqrt_train = torch.sqrt(torch.clamp(train_phi0_f64, min=1e-12)).unsqueeze(1)  # (n, 1)
+        sqrt_test = torch.sqrt(torch.clamp(test_phi0_f64, min=1e-12)).unsqueeze(0)    # (1, k)
         normalizer = sqrt_train * sqrt_test  # (n, k)
 
         # Compute additive error
@@ -488,20 +607,23 @@ def compute_sandwich_bounds(
 def run_experiment(
     grad_cache: GradientCache,
     lambda_values: list,
-    m_multipliers: list,
+    m_values: list,
     proj_type: ProjectionType = ProjectionType.normal,
     num_trials: int = 5,
     num_test_grads: int = 200,
     seed: int = 42,
     device: str = "cuda",
     batch_size: int = 32,
-    min_m: int = 10,
     min_d_lambda: float = 5.0,
     test_mode: str = "self",
     test_grad_cache: GradientCache = None,
 ) -> dict:
     """
     Run spectrum bounds experiment to validate sketched influence approximation.
+
+    Uses fixed m values grid and fast eigendecomposition-based λ sweep for efficiency.
+    For each (m, trial), we project gradients and eigendecompose ONCE, then sweep
+    all λ values in O(n²) per λ instead of O(n³).
 
     Supports two modes:
     - "self": Self-influence scores φ_λ(g_i, g_i) using training gradients only.
@@ -512,14 +634,13 @@ def run_experiment(
     Args:
         grad_cache: GradientCache containing training gradients (forms the Fisher matrix)
         lambda_values: List of regularization values
-        m_multipliers: Multipliers of d_λ to test
+        m_values: Fixed list of projection dimensions to test
         proj_type: Type of random projection
         num_trials: Number of random projection trials per configuration
         num_test_grads: Number of gradients to use for testing (from train or test set)
         seed: Random seed
         device: GPU device
         batch_size: Batch size for GPU operations
-        min_m: Minimum projection dimension
         min_d_lambda: Skip λ values where d_λ < this threshold
         test_mode: "self" for self-influence, "test" for cross-influence with test set
         test_grad_cache: GradientCache for test gradients (required if test_mode="test")
@@ -540,22 +661,30 @@ def run_experiment(
     print(f"  - test_mode = {test_mode}")
     print(f"  - batch_size = {batch_size}")
     print(f"  - n = {n}, d = {d:,}")
-    print(f"  - min_m = {min_m}, min_d_lambda = {min_d_lambda}")
-    print(f"  - {len(m_multipliers)} dim ratio × {num_trials} trials × {len(lambda_values)} λ")
+    print(f"  - {len(m_values)} m values × {num_trials} trials × {len(lambda_values)} λ")
+
+    # Filter out m values that are >= parameter dimension (no projection needed)
+    # Random projection is only meaningful when projecting to lower dimensions
+    original_m_values = m_values
+    m_values = [m for m in m_values if m < d]
+    if len(m_values) < len(original_m_values):
+        print(f"  - Filtered m values: {len(original_m_values)} -> {len(m_values)} "
+              f"(removed m >= d={d})")
+        if not m_values:
+            raise ValueError(f"No valid m values remaining after filtering (all >= d={d})")
+    print(f"  - Testing {len(m_values)} valid m values (m < d={d}): {m_values[:5]}...{m_values[-3:] if len(m_values) > 5 else []}")
 
     # Compute eigenvalues, effective dimensions, and Gram matrix in FLOAT64
-    # This fixes mixed precision instability where float32 causes catastrophic
-    # cancellation in influence score computation for high-dimensional models
+    # We always need eigenvectors now for fast exact score computation
     print(f"\nComputing eigenvalues and Gram matrix (Robust Float64)...")
-    eigenvalues, eff_dims, K = compute_robust_gram(
-        grad_cache, lambda_values, device=device, batch_size=batch_size*4
+    eigenvalues, eff_dims, K, eigenvectors = compute_robust_gram(
+        grad_cache, lambda_values, device=device, batch_size=batch_size*4,
+        return_eigenvectors=True,  # Always need eigenvectors for fast λ sweep
     )
 
     eig_nonzero = eigenvalues[eigenvalues > 1e-10]
     print(f"  Eigenvalue stats: max={eigenvalues[0]:.2e}, min_nonzero={eig_nonzero[-1]:.2e}, "
           f"n_nonzero={len(eig_nonzero)}/{len(eigenvalues)}")
-    # K is already normalized by 1/n and in float64 - no unnormalization needed
-    # The new compute_scores() expects the normalized K
 
     # Compute numerical rank
     threshold = 1e-10 * eigenvalues[0]
@@ -563,13 +692,11 @@ def run_experiment(
 
     # Prepare test vectors based on mode
     if test_mode == "self":
-        # Self-influence: test vectors are from training set
         k_test = min(num_test_grads, n)
         test_vectors = [grad_cache.get_sample(i, device="cpu") for i in range(k_test)]
         V = torch.stack(test_vectors).to(device)  # (k, d)
         print(f"  - Self-influence mode: using {k_test} training gradients as test vectors")
     else:
-        # Test mode: test vectors are from test set
         k_test = min(num_test_grads, test_grad_cache.n_samples)
         test_vectors = [test_grad_cache.get_sample(i, device="cpu") for i in range(k_test)]
         V = torch.stack(test_vectors).to(device)  # (k, d)
@@ -582,127 +709,99 @@ def run_experiment(
     if skipped_lambdas:
         print(f"\nSkipping {len(skipped_lambdas)} λ values with d_λ < {min_d_lambda}")
 
-    # Precompute exact scores for all λ values (doesn't depend on m or trial)
-    # Note: compute_scores now uses float64 internally for numerical stability
-    print(f"\nPrecomputing exact scores for {len(valid_lambdas)} λ values...")
-    exact_scores_by_lambda = {}
+    # =========================================================================
+    # OPTIMIZATION: Precompute exact scores using eigendecomposition for fast λ sweep
+    # Instead of O(n³) per λ, we do O(n³) once + O(n²) per λ
+    # =========================================================================
+    print(f"\nPrecomputing exact scores using eigendecomposition (fast λ sweep)...")
 
-    # For test mode, we also need self-influence scores for error normalization
-    # Based on Theorem 1 Eq (2): |B̃_λ(g,g') - B_λ(g,g')| ≤ ε * sqrt(φ_λ(g)) * sqrt(φ_λ(g'))
-    train_self_scores_by_lambda = {}
-    test_self_scores_by_lambda = {}
+    # Compute U = G @ V^T once (used for all λ)
+    V_dbl = V.to(dtype=torch.float64, device=device)
+    U_exact = torch.zeros(n, k_test, device=device, dtype=torch.float64)
+    for i_start in range(0, n, batch_size):
+        i_end = min(i_start + batch_size, n)
+        G_batch = grad_cache.get_batch(i_start, i_end, device=device)
+        U_exact[i_start:i_end, :] = G_batch.to(dtype=torch.float64) @ V_dbl.T
 
+    # For self mode, also need ||g_i||² for each test sample
+    if test_mode == "self":
+        g_norms_sq = (V_dbl ** 2).sum(dim=1)  # (k,)
+        # U_self = (1/√n) G @ V^T for self-influence Woodbury
+        U_self = U_exact / (n ** 0.5)
+
+    # Precompute W = eigenvectors^T @ U for fast eigenvalue-based solve
+    # For self mode: W_self = eigenvectors^T @ U_self
+    # For test mode: W_test = eigenvectors^T @ U_exact
+    if test_mode == "self":
+        W_exact = eigenvectors.T @ U_self  # (n, k)
+    else:
+        W_exact = eigenvectors.T @ U_exact  # (n, k)
+
+    # Compute φ₀ for test mode (doesn't depend on λ)
+    train_phi0 = None
+    test_phi0 = None
     if test_mode == "test":
-        # For test mode, precompute U_B = G @ V^T once (used for all λ)
-        # Note: G @ V^T is both the U_B matrix and the dot product term g_i · v_j
-        print("  Computing G @ V^T for test mode...")
-        V_dbl = V.to(dtype=torch.float64, device=device)
-        U_B = torch.zeros(n, k_test, device=device, dtype=torch.float64)
-        for i_start in range(0, n, batch_size):
-            i_end = min(i_start + batch_size, n)
-            G_batch = grad_cache.get_batch(i_start, i_end, device=device)
-            U_B[i_start:i_end, :] = G_batch.to(dtype=torch.float64) @ V_dbl.T
-        # G · V = U_B (same computation)
-        G_dot_V = U_B
+        print("  Computing unregularized self-influence φ₀...")
+        train_phi0, test_phi0 = compute_unregularized_self_influence(
+            eigenvalues=eigenvalues,
+            eigenvectors=eigenvectors,
+            U_test=U_exact,
+            n=n,
+        )
+        # Move to CPU for later error computation
+        train_phi0 = train_phi0.cpu()
+        test_phi0 = test_phi0.cpu()
 
-        # Note: We compute training self-influence scores using K directly (not G_all)
-        # since φ_λ(g_i) = (1/λ)[||g_i||² - n * (K @ (K + λI)^{-1} @ K)[i,i]]
-        # and ||g_i||² = n * K[i,i], so we only need K (already computed).
+    # Compute exact scores for all λ using eigendecomposition (FAST!)
+    exact_scores_by_lambda = {}
+    print(f"  Computing exact scores for {len(valid_lambdas)} λ values...")
 
     for lamb in valid_lambdas:
+        inv_eigvals = 1.0 / (eigenvalues + lamb)
+
         if test_mode == "self":
-            # Self-influence: compute diagonal of (V, V) scores
-            exact_scores_by_lambda[lamb] = compute_scores(V, V, grad_cache, lamb, device, batch_size, K).diag()
+            # Self-influence: score_i = (1/λ)[||g_i||² - u_i^T (K + λI)^{-1} u_i]
+            # where u_i = (1/√n) G @ g_i and K = (1/n) G @ G^T
+            # Using eigendecomposition: X = eigenvectors @ (inv_eigvals * W)
+            X = eigenvectors @ (inv_eigvals.unsqueeze(1) * W_exact)  # (n, k)
+            ux_dots = (U_self * X).sum(dim=0)  # (k,)
+            scores = (g_norms_sq - ux_dots) / lamb
+            exact_scores_by_lambda[lamb] = scores.cpu()
         else:
-            # Test mode: compute full (n_train, k_test) score matrix efficiently
-            # Formula: scores[i,j] = (1/λ)[g_i · v_j - U_A[i, :]^T @ X_B[:, j]]
-            # where U_A = G @ G^T = n * K (since K = (1/n) G @ G^T)
-            # and X_B = (K + λI)^{-1} @ (U_B / n) with U_B = G @ V^T
-            #
-            # So: scores[i,j] = (1/λ)[g_i · v_j - (n * K)[i, :] @ X_B[:, j]]
-            #                 = (1/λ)[g_i · v_j - n * (K @ X_B)[i, j]]
-
+            # Test mode: B_λ(g_i, v_j) = (1/λ)[g_i · v_j - (1/n) u_i^T (K + λI)^{-1} w_j]
+            # where u_i = G @ g_i = n * K[:, i], w_j = G @ v_j = U_exact[:, j]
+            # X_B = (K + λI)^{-1} @ (U_exact / n)
+            X_B = eigenvectors @ (inv_eigvals.unsqueeze(1) * W_exact) / n  # (n, k)
+            # Cross term: n * K @ X_B
             K_dbl = K.to(dtype=torch.float64, device=device)
-            reg_matrix = K_dbl + lamb * torch.eye(n, device=device, dtype=torch.float64)
-            rhs = U_B / n
-            X_B = torch.linalg.solve(reg_matrix, rhs)  # (n, k_test)
-
-            # Cross term: n * K @ X_B (n, k_test)
             cross_term = n * (K_dbl @ X_B)
-
-            # scores = (G · V - cross_term) / λ
-            scores = (G_dot_V - cross_term) / lamb
-            exact_scores_by_lambda[lamb] = scores
-
-            # Compute self-influence scores for training gradients: φ_λ(g_i) = g_i^T (F + λI)^{-1} g_i
-            # Using Woodbury: φ_λ(g_i) = (1/λ)[||g_i||² - (1/n) * u_i^T @ (K + λI)^{-1} @ u_i]
-            # where u_i = G @ g_i = (G @ G^T)[i, :] = n * K[i, :]
-            #
-            # The X_train below solves (K + λI) X = K, so X = (K + λI)^{-1} K
-            # Then cross_term_train[i] = (n * K[i, :]) @ X[:, i] / n = K[i, :] @ X[:, i]
-            # Wait, we need to solve for all n training gradients...
-            # Actually, since u_i = G @ g_i and G[i, :] = g_i, we have u_i = G @ G[i, :]^T = n * K[:, i]
-            #
-            # Simpler: φ_λ(g_i) = (1/λ)[||g_i||² - u_i^T @ (K + λI)^{-1} @ u_i / n]
-            # where u_i = G @ g_i = G @ G[i, :]^T = n * K[:, i]
-            # So: φ_λ(g_i) = (1/λ)[||g_i||² - n * K[:, i]^T @ (K + λI)^{-1} @ K[:, i]]
-            #             = (1/λ)[||g_i||² - n * (K^T @ (K + λI)^{-1} @ K)[i, i]]
-            #
-            # For efficiency, compute X_K = (K + λI)^{-1} @ K
-            X_K = torch.linalg.solve(reg_matrix, K_dbl)  # (n, n)
-            cross_train = n * (K_dbl * X_K).sum(dim=0)  # diagonal: n * K[i,:] @ X_K[:,i] = n * (K * X_K^T).sum(0)
-
-            # ||g_i||² = diagonal of G @ G^T = n * K.diag()
-            g_norms_sq = n * K_dbl.diag()  # (n,)
-
-            train_self_scores_by_lambda[lamb] = (g_norms_sq - cross_train) / lamb
-
-            # Compute self-influence scores for test gradients: φ_λ(v_j) = v_j^T (F + λI)^{-1} v_j
-            # Using Woodbury: φ_λ(v_j) = (1/λ)[||v_j||² - (1/n) * w_j^T @ (K + λI)^{-1} @ w_j]
-            # where w_j = G @ v_j = U_B[:, j]
-            X_V = torch.linalg.solve(reg_matrix, U_B / n)  # (n, k)
-            cross_test = (U_B * X_V).sum(dim=0)  # (k,)
-
-            v_norms_sq = (V_dbl ** 2).sum(dim=1)  # (k,)
-            test_self_scores_by_lambda[lamb] = (v_norms_sq - cross_test) / lamb
+            scores = (U_exact - cross_term) / lamb  # G_dot_V = U_exact
+            exact_scores_by_lambda[lamb] = scores.cpu()
 
     print(f"  Done. Exact scores cached for all λ values.")
 
-    # Collect all unique m values and build config mapping
-    # m_to_configs: m -> list of config dicts
-    # per_trial_stats: (m, lamb, mult) -> {trial_idx: {stats dict}}
-    # This enables computing confidence intervals across trials in visualization
-    m_to_configs = {}
+    # =========================================================================
+    # Initialize per_trial_stats for all (m, λ) combinations
+    # =========================================================================
     per_trial_stats = {}
+    for m in m_values:
+        for lamb in valid_lambdas:
+            per_trial_stats[(m, lamb)] = {}
 
-    for lamb in valid_lambdas:
-        d_lambda = eff_dims[lamb]
-        for mult in m_multipliers:
-            m_raw = mult * d_lambda
-            m = max(min_m, min(int(m_raw), d))
-            m_clamped = (m == min_m and m_raw < min_m)
+    # =========================================================================
+    # Main loop: trial → m → λ sweep (FAST: eigendecompose once per m, then sweep λ)
+    # =========================================================================
+    print(f"\nRunning {num_trials} trials × {len(m_values)} m values...")
 
-            if m not in m_to_configs:
-                m_to_configs[m] = []
-            m_to_configs[m].append({
-                "lamb": lamb,
-                "mult": mult,
-                "d_lambda": d_lambda,
-                "m_raw": m_raw,
-                "m_clamped": m_clamped,
-            })
-            per_trial_stats[(m, lamb, mult)] = {}
+    # Iterate from largest m first (most memory intensive) to fail fast if OOM
+    m_values_desc = sorted(m_values, reverse=True)
 
-    m_values_sorted = sorted(m_to_configs.keys())
-    print(f"\nUnique projection dimension to test: {len(m_values_sorted)}")
-
-    # Main loop: trial → m → λ
     for trial in range(num_trials):
         trial_seed = seed + trial
         print(f"\nTrial {trial + 1}/{num_trials} (seed={trial_seed})")
 
-        for m in tqdm(m_values_sorted, desc="  projection dimension"):
-            configs = m_to_configs[m]
+        for m in tqdm(m_values_desc, desc="  projection dimension"):
+            # When m >= d, safe_project will use identity (no projection) as baseline
 
             # Create projector for this (m, trial)
             projector = make_random_projector(
@@ -716,8 +815,8 @@ def run_experiment(
                 dtype=torch.float32,
             )
 
-            # Always precompute for Woodbury path (more numerically stable than direct m×m)
-            # For test mode, we need K_proj for cross-score computation
+            # Precompute Woodbury quantities ONCE per (m, trial)
+            # This includes eigendecomposition of projected Gram matrix
             precomputed = precompute_woodbury(
                 grad_cache=grad_cache,
                 projector=projector,
@@ -727,22 +826,34 @@ def run_experiment(
                 store_k_proj=(test_mode == "test"),
             )
 
-            # Compute bounds for each lambda using precomputed Woodbury quantities
-            for config in configs:
-                lamb = config["lamb"]
-                mult = config["mult"]
+            # Precompute W_sketched for fast λ sweep
+            W_sketched = precomputed.eigenvectors.T @ precomputed.U  # (n, k)
+
+            # Sweep all λ values CHEAPLY using eigendecomposition
+            for lamb in valid_lambdas:
+                inv_eigvals = 1.0 / (precomputed.eigenvalues + lamb)
+
                 if test_mode == "self":
-                    bounds = compute_sandwich_bounds(
-                        lamb=lamb,
-                        exact_scores=exact_scores_by_lambda[lamb],
-                        precomputed=precomputed,
-                        test_mode=test_mode,
-                    )
-                    ratios = bounds["ratios"].numpy()
-                    valid_ratios = ratios[~np.isnan(ratios)].flatten()
-                    # Compute per-trial statistics (epsilon = |ratio - 1| for self mode)
+                    # Sketched self-influence using eigendecomposition
+                    X = precomputed.eigenvectors @ (inv_eigvals.unsqueeze(1) * W_sketched)
+                    ux_dots = (precomputed.U * X).sum(dim=0)  # (k,)
+                    sketched_scores = (precomputed.pv_norms_sq - ux_dots) / lamb
+
+                    # Compute error metrics
+                    exact_scores = exact_scores_by_lambda[lamb]
+                    sketched_scores_cpu = sketched_scores.cpu()
+
+                    # Filter valid scores
+                    max_score = exact_scores.abs().max()
+                    relative_threshold = max(1e-10 * max_score.item(), 1e-12)
+                    valid_mask = exact_scores.abs() > relative_threshold
+
+                    ratios = torch.zeros_like(exact_scores)
+                    ratios[valid_mask] = sketched_scores_cpu[valid_mask] / exact_scores[valid_mask]
+                    valid_ratios = ratios[valid_mask].numpy()
+
                     eps_values = np.abs(valid_ratios - 1)
-                    per_trial_stats[(m, lamb, mult)][trial] = {
+                    per_trial_stats[(m, lamb)][trial] = {
                         "mean_ratio": np.mean(valid_ratios),
                         "std_ratio": np.std(valid_ratios),
                         "min_ratio": np.min(valid_ratios),
@@ -754,19 +865,28 @@ def run_experiment(
                         "n_samples": len(valid_ratios),
                     }
                 else:
-                    # test mode: pass self-influence scores for normalization
-                    bounds = compute_sandwich_bounds(
-                        lamb=lamb,
-                        exact_scores=exact_scores_by_lambda[lamb],
-                        precomputed=precomputed,
-                        test_mode=test_mode,
-                        train_self_scores=train_self_scores_by_lambda[lamb],
-                        test_self_scores=test_self_scores_by_lambda[lamb],
-                    )
-                    # For test mode, epsilon is already the normalized additive error
-                    epsilon = bounds["epsilon"].numpy()
-                    valid_epsilon = epsilon[~np.isnan(epsilon)].flatten()
-                    per_trial_stats[(m, lamb, mult)][trial] = {
+                    # Sketched cross-scores using eigendecomposition
+                    X = precomputed.eigenvectors @ (inv_eigvals.unsqueeze(1) * W_sketched)
+                    pg_dot_pv = (n ** 0.5) * precomputed.U
+                    cross_term = (n ** 0.5) * (precomputed.K_proj @ X)
+                    sketched_scores = (pg_dot_pv - cross_term) / lamb
+
+                    # Compute normalized error (all on CPU)
+                    exact_scores = exact_scores_by_lambda[lamb]
+                    sketched_scores_cpu = sketched_scores.cpu()
+
+                    # Compute normalizer: sqrt(φ₀(g_i)) * sqrt(φ₀(v_j)) - already on CPU
+                    sqrt_train = torch.sqrt(torch.clamp(train_phi0, min=1e-12)).unsqueeze(1)
+                    sqrt_test = torch.sqrt(torch.clamp(test_phi0, min=1e-12)).unsqueeze(0)
+                    normalizer = sqrt_train * sqrt_test
+
+                    additive_error = (sketched_scores_cpu - exact_scores).abs()
+                    valid_mask = normalizer > 1e-12
+                    epsilon = torch.zeros_like(additive_error)
+                    epsilon[valid_mask] = additive_error[valid_mask] / normalizer[valid_mask]
+
+                    valid_epsilon = epsilon[valid_mask].numpy()
+                    per_trial_stats[(m, lamb)][trial] = {
                         "eps_mean": np.mean(valid_epsilon),
                         "eps_max": np.max(valid_epsilon),
                         "eps_median": np.median(valid_epsilon),
@@ -775,17 +895,23 @@ def run_experiment(
                         "n_samples": len(valid_epsilon),
                     }
 
+            # Explicit memory cleanup after processing each m value
+            del precomputed, W_sketched
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    # =========================================================================
     # Build results dict with metadata and aggregated experiment results
+    # =========================================================================
     print("Aggregating results...")
     results = {
         "n_samples": n,
         "d_params": d,
         "proj_type": proj_type.value,
         "lambda_values": lambda_values,
-        "m_multipliers": m_multipliers,
+        "m_values": m_values,
         "effective_dims": eff_dims,
         "batch_size": batch_size,
-        "min_m": min_m,
         "min_d_lambda": min_d_lambda,
         "num_trials": num_trials,
         "skipped_configs": [
@@ -800,20 +926,17 @@ def run_experiment(
         "experiments": [],
     }
 
-    for m, configs in m_to_configs.items():
-        for config in configs:
-            trial_stats = per_trial_stats[(m, config["lamb"], config["mult"])]
+    for m in m_values:
+        for lamb in valid_lambdas:
+            trial_stats = per_trial_stats[(m, lamb)]
             if len(trial_stats) == 0:
                 continue
 
-            # Aggregate statistics across trials
-            # Each trial has its own statistics computed over k (or n×k) samples
-            # We compute mean ± std across trials for confidence intervals
             trial_list = list(trial_stats.values())
-            n_trials = len(trial_list)
+            n_trials_actual = len(trial_list)
+            d_lambda = eff_dims[lamb]
 
             if test_mode == "self":
-                # Extract per-trial values
                 trial_mean_ratios = np.array([t["mean_ratio"] for t in trial_list])
                 trial_eps_means = np.array([t["eps_mean"] for t in trial_list])
                 trial_eps_maxs = np.array([t["eps_max"] for t in trial_list])
@@ -822,30 +945,23 @@ def run_experiment(
 
                 results["experiments"].append({
                     "m": m,
-                    "lambda": config["lamb"],
-                    "multiplier": config["mult"],
-                    "d_lambda": config["d_lambda"],
-                    "m_raw": config["m_raw"],
-                    "m_clamped": config["m_clamped"],
-                    "m_over_d_lambda": m / config["d_lambda"] if config["d_lambda"] > 0 else float('inf'),
-                    "n_trials": n_trials,
-                    # Per-trial statistics (for CI computation in visualization)
+                    "lambda": lamb,
+                    "d_lambda": d_lambda,
+                    "m_over_d_lambda": m / d_lambda if d_lambda > 0 else float('inf'),
+                    "n_trials": n_trials_actual,
                     "per_trial": trial_stats,
-                    # Aggregate ratio statistics across trials
                     "mean_ratio": np.mean(trial_mean_ratios),
-                    "mean_ratio_std": np.std(trial_mean_ratios, ddof=1) if n_trials > 1 else 0.0,
-                    # Aggregate epsilon statistics across trials (mean ± std for CIs)
+                    "mean_ratio_std": np.std(trial_mean_ratios, ddof=1) if n_trials_actual > 1 else 0.0,
                     "empirical_eps_mean": np.mean(trial_eps_means),
-                    "empirical_eps_mean_std": np.std(trial_eps_means, ddof=1) if n_trials > 1 else 0.0,
+                    "empirical_eps_mean_std": np.std(trial_eps_means, ddof=1) if n_trials_actual > 1 else 0.0,
                     "empirical_eps_max": np.mean(trial_eps_maxs),
-                    "empirical_eps_max_std": np.std(trial_eps_maxs, ddof=1) if n_trials > 1 else 0.0,
+                    "empirical_eps_max_std": np.std(trial_eps_maxs, ddof=1) if n_trials_actual > 1 else 0.0,
                     "empirical_eps_95": np.mean(trial_eps_95s),
-                    "empirical_eps_95_std": np.std(trial_eps_95s, ddof=1) if n_trials > 1 else 0.0,
+                    "empirical_eps_95_std": np.std(trial_eps_95s, ddof=1) if n_trials_actual > 1 else 0.0,
                     "empirical_eps_99": np.mean(trial_eps_99s),
-                    "empirical_eps_99_std": np.std(trial_eps_99s, ddof=1) if n_trials > 1 else 0.0,
+                    "empirical_eps_99_std": np.std(trial_eps_99s, ddof=1) if n_trials_actual > 1 else 0.0,
                 })
             else:
-                # Test mode: epsilon is already the normalized additive error
                 trial_eps_means = np.array([t["eps_mean"] for t in trial_list])
                 trial_eps_maxs = np.array([t["eps_max"] for t in trial_list])
                 trial_eps_medians = np.array([t["eps_median"] for t in trial_list])
@@ -854,27 +970,23 @@ def run_experiment(
 
                 results["experiments"].append({
                     "m": m,
-                    "lambda": config["lamb"],
-                    "multiplier": config["mult"],
-                    "d_lambda": config["d_lambda"],
-                    "m_raw": config["m_raw"],
-                    "m_clamped": config["m_clamped"],
-                    "m_over_d_lambda": m / config["d_lambda"] if config["d_lambda"] > 0 else float('inf'),
-                    "n_trials": n_trials,
-                    # Per-trial statistics (for CI computation in visualization)
+                    "lambda": lamb,
+                    "d_lambda": d_lambda,
+                    "m_over_d_lambda": m / d_lambda if d_lambda > 0 else float('inf'),
+                    "n_trials": n_trials_actual,
                     "per_trial": trial_stats,
-                    # Aggregate epsilon statistics across trials (mean ± std for CIs)
                     "empirical_eps_mean": np.mean(trial_eps_means),
-                    "empirical_eps_mean_std": np.std(trial_eps_means, ddof=1) if n_trials > 1 else 0.0,
+                    "empirical_eps_mean_std": np.std(trial_eps_means, ddof=1) if n_trials_actual > 1 else 0.0,
                     "empirical_eps_max": np.mean(trial_eps_maxs),
-                    "empirical_eps_max_std": np.std(trial_eps_maxs, ddof=1) if n_trials > 1 else 0.0,
+                    "empirical_eps_max_std": np.std(trial_eps_maxs, ddof=1) if n_trials_actual > 1 else 0.0,
                     "empirical_eps_median": np.mean(trial_eps_medians),
-                    "empirical_eps_median_std": np.std(trial_eps_medians, ddof=1) if n_trials > 1 else 0.0,
+                    "empirical_eps_median_std": np.std(trial_eps_medians, ddof=1) if n_trials_actual > 1 else 0.0,
                     "empirical_eps_95": np.mean(trial_eps_95s),
-                    "empirical_eps_95_std": np.std(trial_eps_95s, ddof=1) if n_trials > 1 else 0.0,
+                    "empirical_eps_95_std": np.std(trial_eps_95s, ddof=1) if n_trials_actual > 1 else 0.0,
                     "empirical_eps_99": np.mean(trial_eps_99s),
-                    "empirical_eps_99_std": np.std(trial_eps_99s, ddof=1) if n_trials > 1 else 0.0,
+                    "empirical_eps_99_std": np.std(trial_eps_99s, ddof=1) if n_trials_actual > 1 else 0.0,
                 })
+
     return results
 
 
@@ -906,9 +1018,6 @@ def main():
                        help="Directory for gradient cache (only used with --offload disk)")
 
     # Numerical stability options
-    parser.add_argument("--min_m", type=int, default=1,
-                       help="Minimum projection dimension to avoid numerical degeneracy. "
-                            "When mult * d_λ < min_m, m is clamped to min_m. (default: 1)")
     parser.add_argument("--min_d_lambda", type=float, default=1.0,
                        help="Skip λ values where d_λ < this threshold (numerically degenerate). "
                             "(default: 1.0)")
@@ -918,12 +1027,25 @@ def main():
                        choices=["self", "test"],
                        help="Test mode: 'self' for self-influence (diagonal scores), "
                             "'test' for cross-influence with test set gradients.")
-    parser.add_argument("--num_test_grads", type=int, default=200,
+    parser.add_argument("--num_test_grads", type=int, default=500,
                        help="Number of test gradients to use (from train set for 'self', "
                             "from test set for 'test').")
-    parser.add_argument("--lambda_values", type=str, default=None,
-                       help="Comma-separated list of lambda values (e.g., '1e-6,1e-5,1e-4'). "
-                            "If not specified, uses default range.")
+
+    # Lambda sweep configuration (integer powers of 10, or log-spaced if lambda_steps specified)
+    parser.add_argument("--lambda_exp_min", type=int, default=-8,
+                       help="Minimum exponent for λ sweep: λ_min = 10^exp_min (default: -8 → 1e-8)")
+    parser.add_argument("--lambda_exp_max", type=int, default=2,
+                       help="Maximum exponent for λ sweep: λ_max = 10^exp_max (default: 2 → 1e2)")
+    parser.add_argument("--lambda_steps", type=int, default=0,
+                       help="Number of log-spaced λ values. If 0 (default), uses integer powers of 10.")
+
+    # Projection dimension grid (powers of 2, like lambda uses powers of 10)
+    parser.add_argument("--m_exp_min", type=int, default=2,
+                       help="Minimum exponent for m sweep: m_min = 2^exp_min (default: 2 → 4)")
+    parser.add_argument("--m_exp_max", type=int, default=20,
+                       help="Maximum exponent for m sweep: m_max = 2^exp_max (default: 20 → 1048576)")
+    parser.add_argument("--m_steps", type=int, default=0,
+                       help="Number of log2-spaced m values. If 0 (default), uses integer powers of 2.")
 
     args = parser.parse_args()
 
@@ -954,7 +1076,16 @@ def main():
     print(f"\nLoading {args.model} on {args.dataset}...")
 
     model_details, _ = load_benchmark(model=args.model, dataset=args.dataset, metric="lds")
+
+    # CRITICAL FIX: Load the checkpoint that corresponds to the ground truth
+    # This ensures d_λ values are consistent with hyperparam_selection.py
     nn_model = model_details["model"]
+    checkpoint = torch.load(model_details["models_full"][0], map_location=args.device)
+    nn_model.load_state_dict(checkpoint)
+    nn_model.to(args.device)
+    nn_model.eval()
+    print(f"Loaded checkpoint: {model_details['models_full'][0]}")
+
     train_dataset = model_details["train_dataset"]
     train_sampler = model_details["train_sampler"]
     indices = list(train_sampler)
@@ -1016,24 +1147,46 @@ def main():
             )
 
     # Experiment configuration
-    if args.lambda_values:
-        lambda_values = [float(x) for x in args.lambda_values.split(",")]
+    # Generate λ values: integer powers of 10 if lambda_steps=0, else log-spaced
+    if args.lambda_steps == 0:
+        lambda_values = [10.0 ** exp for exp in range(args.lambda_exp_min, args.lambda_exp_max + 1)]
+        print(f"\nλ sweep configuration:")
+        print(f"  Exponent range: [{args.lambda_exp_min}, {args.lambda_exp_max}]")
+        print(f"  λ values: {[f'1e{exp}' for exp in range(args.lambda_exp_min, args.lambda_exp_max + 1)]}")
     else:
-        lambda_values = [1e-4, 1e-3, 1e-2, 1e-1, 1e0, 1e1, 1e2]
-    m_multipliers = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 2048.0, 4096.0]
+        lambda_values = np.logspace(args.lambda_exp_min, args.lambda_exp_max, num=args.lambda_steps).tolist()
+        print(f"\nλ sweep configuration:")
+        print(f"  Range: [1e{args.lambda_exp_min}, 1e{args.lambda_exp_max}] ({args.lambda_steps} log-spaced steps)")
+
+    # Generate m values: integer powers of 2 if m_steps=0, else log2-spaced
+    if args.m_steps == 0:
+        m_values = [2 ** exp for exp in range(args.m_exp_min, args.m_exp_max + 1)]
+        print(f"\nm sweep configuration:")
+        print(f"  Exponent range: [{args.m_exp_min}, {args.m_exp_max}]")
+        print(f"  m values: {[f'2^{exp}' for exp in range(args.m_exp_min, args.m_exp_max + 1)]}")
+        print(f"  m values (decimal): {m_values}")
+    else:
+        m_values = np.unique(np.logspace(
+            args.m_exp_min * np.log10(2),  # Convert base-2 exponents to base-10
+            args.m_exp_max * np.log10(2),
+            num=args.m_steps,
+            base=10
+        ).astype(int)).tolist()
+        print(f"\nm sweep configuration:")
+        print(f"  Range: [2^{args.m_exp_min}, 2^{args.m_exp_max}] ({args.m_steps} log2-spaced steps)")
+        print(f"  m values: {m_values}")
 
     # Run experiment
     results = run_experiment(
         grad_cache=grad_cache,
         lambda_values=lambda_values,
-        m_multipliers=m_multipliers,
+        m_values=m_values,
         proj_type=proj_type,
         num_trials=args.num_trials,
         num_test_grads=args.num_test_grads,
         seed=args.seed,
         device=args.device,
         batch_size=args.batch_size,
-        min_m=args.min_m,
         min_d_lambda=args.min_d_lambda,
         test_mode=args.test_mode,
         test_grad_cache=test_grad_cache,

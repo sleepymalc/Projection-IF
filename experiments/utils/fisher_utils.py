@@ -13,6 +13,31 @@ if TYPE_CHECKING:
 
 
 # =============================================================================
+# Safe Projection Helper
+# =============================================================================
+
+def safe_project(data: Tensor, projector, d: int, ensemble_id: int = 0) -> Tensor:
+    """
+    Safely project data, using identity (no projection) when m >= d.
+
+    Args:
+        data: Input tensor of shape (batch, d)
+        projector: Projector with .project() method and .proj_dim attribute
+        d: Original dimension
+        ensemble_id: Ensemble ID for projection
+
+    Returns:
+        Projected tensor of shape (batch, m) if m < d, else original tensor
+    """
+    m = projector.proj_dim
+    if m >= d:
+        # No projection needed when target dimension >= source dimension
+        return data
+    else:
+        return projector.project(data, ensemble_id=ensemble_id)
+
+
+# =============================================================================
 # Gram Matrix Computation
 # =============================================================================
 
@@ -59,7 +84,8 @@ def _compute_gram_matrix(
     # Helper to apply projection (if projector provided)
     def maybe_project(data_gpu):
         if projector is not None:
-            return projector.project(data_gpu, ensemble_id=0)
+            d = grad_cache.dim
+            return safe_project(data_gpu, projector, d, ensemble_id=0)
         return data_gpu
 
     if use_disk_mode: # Disk mode: Double-buffering with background disk prefetch
@@ -261,7 +287,15 @@ def project_gradients_to_cpu(
     """
     n = grad_cache.n_samples
     m = projector.proj_dim
+    d = grad_cache.dim
     dtype = grad_cache.dtype
+
+    # Validate projection dimension
+    if m >= d:
+        raise ValueError(
+            f"Invalid projection dimension: m={m} must be < d={d}. "
+            f"Random projection is only meaningful when projecting to lower dimensions."
+        )
 
     PG_cpu = torch.zeros(n, m, dtype=dtype, device="cpu")
 
@@ -273,11 +307,17 @@ def project_gradients_to_cpu(
     for i_start in range(0, n, batch_size):
         i_end = min(i_start + batch_size, n)
         g_batch = grad_cache.get_batch(i_start, i_end, device=device)
-        pg_batch = projector.project(g_batch, ensemble_id=0)
+        pg_batch = safe_project(g_batch, projector, d, ensemble_id=0)
         PG_cpu[i_start:i_end] = pg_batch.cpu()
 
         if test_vectors is not None:
             U[i_start:i_end] = pg_batch @ test_vectors.T
+
+        # Explicitly free GPU memory
+        del g_batch, pg_batch
+        # Periodically clear CUDA cache to avoid fragmentation
+        if (i_start // batch_size) % 20 == 0:
+            torch.cuda.empty_cache()
 
     if test_vectors is not None:
         return PG_cpu, U
