@@ -261,15 +261,16 @@ def compute_eigenspectrum(
 # Shared Projection and Kernel Utilities
 # =============================================================================
 
-def project_gradients_to_cpu(
+def project_gradients(
     grad_cache: GradientCache,
     projector,
     device: str = "cuda",
     batch_size: int = 64,
     test_vectors: Optional[Tensor] = None,
+    storage_device: str = "cpu",
 ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
     """
-    Project all gradients and store on CPU, optionally computing cross-products.
+    Project all gradients and store on storage_device, optionally computing cross-products.
 
     This is the first step in Woodbury-based methods when m > n.
 
@@ -280,9 +281,10 @@ def project_gradients_to_cpu(
         batch_size: Batch size for streaming
         test_vectors: Optional projected test vectors (k, m) on device.
                       If provided, also computes U = PG @ test_vectors^T
+        storage_device: Device to store projected gradients (default "cpu")
 
     Returns:
-        PG: Projected gradients (n, m) on CPU
+        PG: Projected gradients (n, m) on storage_device
         U (optional): Cross-product matrix (n, k) on device if test_vectors provided
     """
     n = grad_cache.n_samples
@@ -297,7 +299,7 @@ def project_gradients_to_cpu(
             f"Random projection is only meaningful when projecting to lower dimensions."
         )
 
-    PG_cpu = torch.zeros(n, m, dtype=dtype, device="cpu")
+    PG = torch.zeros(n, m, dtype=dtype, device=storage_device)
 
     # Optionally compute U = PG @ PV^T
     if test_vectors is not None:
@@ -308,7 +310,7 @@ def project_gradients_to_cpu(
         i_end = min(i_start + batch_size, n)
         g_batch = grad_cache.get_batch(i_start, i_end, device=device)
         pg_batch = safe_project(g_batch, projector, d, ensemble_id=0)
-        PG_cpu[i_start:i_end] = pg_batch.cpu()
+        PG[i_start:i_end] = pg_batch.to(storage_device)
 
         if test_vectors is not None:
             U[i_start:i_end] = pg_batch @ test_vectors.T
@@ -320,8 +322,8 @@ def project_gradients_to_cpu(
             torch.cuda.empty_cache()
 
     if test_vectors is not None:
-        return PG_cpu, U
-    return PG_cpu
+        return PG, U
+    return PG
 
 
 def compute_kernel_from_projected(
@@ -367,3 +369,79 @@ def compute_kernel_from_projected(
         K = K / n
 
     return K
+
+
+# =============================================================================
+# Effective Dimension
+# =============================================================================
+
+def compute_effective_dimension(eigenvalues: Tensor, lamb: float) -> float:
+    """Compute effective dimension d_λ = Σ_i σ_i / (σ_i + λ)."""
+    return torch.sum(eigenvalues / (eigenvalues + lamb)).item()
+
+
+# =============================================================================
+# Unregularized Self-Influence (φ₀)
+# =============================================================================
+
+def compute_unregularized_self_influence(
+    eigenvalues: Tensor,
+    eigenvectors: Tensor,
+    U_test: Tensor = None,
+    n: int = None,
+    eps: float = 1e-10,
+) -> Tuple[Tensor, Tensor]:
+    """
+    Compute unregularized self-influence φ₀(g) = g^T F^† g for training and test samples.
+
+    For training gradients g_i (rows of G):
+        φ₀(g_i) = n × Σ_{j: λ_j > ε} Q[i,j]²
+
+    For test gradients v:
+        w = G @ v (projection into Gram space)
+        φ₀(v) = (1/n) × ||K^† w||² = (1/n) × Σ_{j: λ_j > ε} (Q^T w)_j² / λ_j²
+
+    Args:
+        eigenvalues: Eigenvalues of K in descending order (n,)
+        eigenvectors: Eigenvectors of K, columns in descending order (n, n)
+        U_test: G @ V^T for test gradients V, shape (n, k). If None, only train φ₀ is computed.
+        n: Number of training samples (for normalization)
+        eps: Threshold for non-zero eigenvalues (relative to max eigenvalue)
+
+    Returns:
+        train_phi0: φ₀ for training samples, shape (n,)
+        test_phi0: φ₀ for test samples, shape (k,), or None if U_test is None
+    """
+    if n is None:
+        n = eigenvalues.shape[0]
+
+    # Determine non-zero eigenvalues (relative threshold)
+    threshold = eps * eigenvalues[0].item() if eigenvalues[0] > 0 else eps
+    nonzero_mask = eigenvalues > threshold
+    n_nonzero = nonzero_mask.sum().item()
+
+    print(f"  φ₀ computation: {n_nonzero}/{len(eigenvalues)} non-zero eigenvalues (threshold={threshold:.2e})")
+
+    # Training samples: φ₀(g_i) = n × Σ_{j: λ_j > ε} Q[i,j]²
+    # This uses the fact that g_i is the i-th row of G, so u_i = G @ g_i = n * K[:, i]
+    # and K^† K is the projection onto the range of K
+    Q_nonzero = eigenvectors[:, nonzero_mask]  # (n, r) where r = n_nonzero
+    train_phi0 = n * (Q_nonzero ** 2).sum(dim=1)  # (n,)
+
+    # Test samples: φ₀(v_j) = (1/n) × ||K^† w_j||²
+    # where w_j = G @ v_j = U_test[:, j]
+    # K^† w = Q Λ^† Q^T w, so ||K^† w||² = Σ_j (Q^T w)_j² / λ_j² for non-zero λ
+    if U_test is not None:
+        # Project U_test onto eigenbasis: Z = Q^T @ U_test, shape (n, k)
+        Z = eigenvectors.T @ U_test  # (n, k)
+
+        # For non-zero eigenvalues, compute (z / λ)² and sum
+        inv_lambda_sq = torch.zeros_like(eigenvalues)
+        inv_lambda_sq[nonzero_mask] = 1.0 / (eigenvalues[nonzero_mask] ** 2)
+
+        # ||K^† w_j||² = Σ_i (Z[i,j] / λ_i)² for non-zero λ
+        test_phi0 = (1.0 / n) * (inv_lambda_sq.unsqueeze(1) * (Z ** 2)).sum(dim=0)  # (k,)
+    else:
+        test_phi0 = None
+
+    return train_phi0, test_phi0

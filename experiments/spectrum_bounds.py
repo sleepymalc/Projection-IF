@@ -17,37 +17,13 @@ from dattri.func.projection import (
     ProjectionType,
 )
 from dattri.benchmark.load import load_benchmark
-from utils.fisher_utils import (
+from utils.fisher import (
     compute_eigenspectrum,
-    project_gradients_to_cpu,
+    safe_project,
+    compute_unregularized_self_influence,
 )
 from utils.gradient_cache import GradientCache
 from typing import Tuple
-
-
-# =============================================================================
-# Safe Projection Helper
-# =============================================================================
-
-def safe_project(data: Tensor, projector, d: int, ensemble_id: int = 0) -> Tensor:
-    """
-    Safely project data, using identity (no projection) when m >= d.
-
-    Args:
-        data: Input tensor of shape (batch, d)
-        projector: Projector with .project() method and .proj_dim attribute
-        d: Original dimension
-        ensemble_id: Ensemble ID for projection
-
-    Returns:
-        Projected tensor of shape (batch, m) if m < d, else original tensor
-    """
-    m = projector.proj_dim
-    if m >= d:
-        # No projection needed when target dimension >= source dimension
-        return data
-    else:
-        return projector.project(data, ensemble_id=ensemble_id)
 
 
 # =============================================================================
@@ -130,71 +106,6 @@ def compute_robust_gram(
         effective_dims[lamb] = d_lambda
 
     return eigenvalues, effective_dims, K, eigenvectors
-
-
-def compute_unregularized_self_influence(
-    eigenvalues: Tensor,
-    eigenvectors: Tensor,
-    U_test: Tensor = None,
-    n: int = None,
-    eps: float = 1e-10,
-) -> Tuple[Tensor, Tensor]:
-    """
-    Compute unregularized self-influence φ₀(g) = g^T F^† g for training and test samples.
-
-    For training gradients g_i (rows of G):
-        φ₀(g_i) = n × Σ_{j: λ_j > ε} Q[i,j]²
-
-    For test gradients v:
-        w = G @ v (projection into Gram space)
-        φ₀(v) = (1/n) × ||K^† w||² = (1/n) × Σ_{j: λ_j > ε} (Q^T w)_j² / λ_j²
-
-    Args:
-        eigenvalues: Eigenvalues of K in descending order (n,)
-        eigenvectors: Eigenvectors of K, columns in descending order (n, n)
-        U_test: G @ V^T for test gradients V, shape (n, k). If None, only train φ₀ is computed.
-        n: Number of training samples (for normalization)
-        eps: Threshold for non-zero eigenvalues (relative to max eigenvalue)
-
-    Returns:
-        train_phi0: φ₀ for training samples, shape (n,)
-        test_phi0: φ₀ for test samples, shape (k,), or None if U_test is None
-    """
-    if n is None:
-        n = eigenvalues.shape[0]
-
-    # Determine non-zero eigenvalues (relative threshold)
-    threshold = eps * eigenvalues[0].item() if eigenvalues[0] > 0 else eps
-    nonzero_mask = eigenvalues > threshold
-    n_nonzero = nonzero_mask.sum().item()
-
-    print(f"  φ₀ computation: {n_nonzero}/{len(eigenvalues)} non-zero eigenvalues (threshold={threshold:.2e})")
-
-    # Training samples: φ₀(g_i) = n × Σ_{j: λ_j > ε} Q[i,j]²
-    # This uses the fact that g_i is the i-th row of G, so u_i = G @ g_i = n * K[:, i]
-    # and K^† K is the projection onto the range of K
-    Q_nonzero = eigenvectors[:, nonzero_mask]  # (n, r) where r = n_nonzero
-    train_phi0 = n * (Q_nonzero ** 2).sum(dim=1)  # (n,)
-
-    # Test samples: φ₀(v_j) = (1/n) × ||K^† w_j||²
-    # where w_j = G @ v_j = U_test[:, j]
-    # K^† w = Q Λ^† Q^T w, so ||K^† w||² = Σ_j (Q^T w)_j² / λ_j² for non-zero λ
-    if U_test is not None:
-        # Project U_test onto eigenbasis: Z = Q^T @ U_test, shape (n, k)
-        Z = eigenvectors.T @ U_test  # (n, k)
-
-        # For non-zero eigenvalues, compute (z / λ)² and sum
-        # Z_nonzero = Z[nonzero_mask, :]  # (r, k)
-        # lambda_nonzero = eigenvalues[nonzero_mask]  # (r,)
-        inv_lambda_sq = torch.zeros_like(eigenvalues)
-        inv_lambda_sq[nonzero_mask] = 1.0 / (eigenvalues[nonzero_mask] ** 2)
-
-        # ||K^† w_j||² = Σ_i (Z[i,j] / λ_i)² for non-zero λ
-        test_phi0 = (1.0 / n) * (inv_lambda_sq.unsqueeze(1) * (Z ** 2)).sum(dim=0)  # (k,)
-    else:
-        test_phi0 = None
-
-    return train_phi0, test_phi0
 
 
 # =============================================================================

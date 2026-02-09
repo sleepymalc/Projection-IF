@@ -26,89 +26,15 @@ from tqdm import tqdm
 from dattri.benchmark.load import load_benchmark
 from dattri.func.projection import make_random_projector, ProjectionType
 
-from utils.fisher_utils import compute_eigenspectrum
+from utils.fisher import (
+    compute_eigenspectrum,
+    safe_project,
+    compute_unregularized_self_influence,
+    compute_effective_dimension,
+)
 from utils.gradient_cache import GradientCache, create_gradient_cache
-from utils.metrics_gpu import lds_gpu, spearman_correlation_gpu
-
-
-# =============================================================================
-# Safe Projection Helper
-# =============================================================================
-
-def safe_project(data: Tensor, projector, d: int, ensemble_id: int = 0) -> Tensor:
-    """
-    Safely project data, using identity (no projection) when m >= d.
-
-    Args:
-        data: Input tensor of shape (batch, d)
-        projector: Projector with .project() method and .proj_dim attribute
-        d: Original dimension
-        ensemble_id: Ensemble ID for projection
-
-    Returns:
-        Projected tensor of shape (batch, m) if m < d, else original tensor
-    """
-    m = projector.proj_dim
-    if m >= d:
-        # No projection needed when target dimension >= source dimension
-        return data
-    else:
-        return projector.project(data, ensemble_id=ensemble_id)
-
-
-# =============================================================================
-# Unregularized Self-Influence (φ₀) Computation
-# =============================================================================
-
-def compute_unregularized_self_influence(
-    eigenvalues: Tensor,
-    eigenvectors: Tensor,
-    U_test: Tensor = None,
-    n: int = None,
-    eps: float = 1e-10,
-) -> Tuple[Tensor, Tensor]:
-    """
-    Compute unregularized self-influence φ₀(g) = g^T F^† g for training and test samples.
-
-    For training gradients g_i (rows of G):
-        φ₀(g_i) = n × Σ_{j: λ_j > ε} Q[i,j]²
-
-    For test gradients v:
-        w = G @ v (projection into Gram space)
-        φ₀(v) = (1/n) × ||K^† w||² = (1/n) × Σ_{j: λ_j > ε} (Q^T w)_j² / λ_j²
-
-    Args:
-        eigenvalues: Eigenvalues of K in descending order (n,)
-        eigenvectors: Eigenvectors of K, columns in descending order (n, n)
-        U_test: G @ V^T for test gradients V, shape (n, k). If None, only train φ₀ is computed.
-        n: Number of training samples (for normalization)
-        eps: Threshold for non-zero eigenvalues (relative to max eigenvalue)
-
-    Returns:
-        train_phi0: φ₀ for training samples, shape (n,)
-        test_phi0: φ₀ for test samples, shape (k,), or None if U_test is None
-    """
-    if n is None:
-        n = eigenvalues.shape[0]
-
-    # Determine non-zero eigenvalues (relative threshold)
-    threshold = eps * eigenvalues[0].item() if eigenvalues[0] > 0 else eps
-    nonzero_mask = eigenvalues > threshold
-
-    # Training samples: φ₀(g_i) = n × Σ_{j: λ_j > ε} Q[i,j]²
-    Q_nonzero = eigenvectors[:, nonzero_mask]  # (n, r) where r = n_nonzero
-    train_phi0 = n * (Q_nonzero ** 2).sum(dim=1)  # (n,)
-
-    # Test samples: φ₀(v_j) = (1/n) × ||K^† w_j||²
-    if U_test is not None:
-        Z = eigenvectors.T @ U_test  # (n, k)
-        inv_lambda_sq = torch.zeros_like(eigenvalues)
-        inv_lambda_sq[nonzero_mask] = 1.0 / (eigenvalues[nonzero_mask] ** 2)
-        test_phi0 = (1.0 / n) * (inv_lambda_sq.unsqueeze(1) * (Z ** 2)).sum(dim=0)  # (k,)
-    else:
-        test_phi0 = None
-
-    return train_phi0, test_phi0
+from utils.metrics import lds
+from utils.data import get_validation_split_indices
 
 
 # =============================================================================
@@ -475,15 +401,6 @@ def compute_bilinear_faithfulness_metrics(
 
 
 # =============================================================================
-# Effective Dimension Computation
-# =============================================================================
-
-def compute_effective_dimension(eigenvalues: torch.Tensor, lamb: float) -> float:
-    """Compute effective dimension d_λ = Σ_i σ_i / (σ_i + λ)."""
-    return torch.sum(eigenvalues / (eigenvalues + lamb)).item()
-
-
-# =============================================================================
 # Joint Sweep with Empirical Faithfulness
 # =============================================================================
 
@@ -642,12 +559,12 @@ def run_lambda_sweep_for_m(
 
         # Compute validation LDS (GPU-accelerated)
         val_scores_T = U @ (inv_diag.unsqueeze(1) * UT_Kval_T)
-        val_lds_score = lds_gpu(val_scores_T, val_gt, device=device)
+        val_lds_score = lds(val_scores_T, val_gt, device=device)
         mean_val_lds = torch.mean(val_lds_score[~torch.isnan(val_lds_score)]).item()
 
         # Compute test LDS (using same eigendecomposition - very efficient!)
         test_scores_T = U @ (inv_diag.unsqueeze(1) * UT_Ktest_T)
-        test_lds_score = lds_gpu(test_scores_T, test_gt, device=device)
+        test_lds_score = lds(test_scores_T, test_gt, device=device)
         mean_test_lds = torch.mean(test_lds_score[~torch.isnan(test_lds_score)]).item()
 
         # Compute bilinear form faithfulness metrics with φ₀ normalization
@@ -1055,20 +972,6 @@ def print_analysis(analysis: Dict):
 # =============================================================================
 # Data Loading Utilities
 # =============================================================================
-
-def get_validation_split_indices(test_sampler, val_ratio=0.1, seed=0):
-    """Split test set into validation and test."""
-    test_indices = list(test_sampler)
-    num_test = len(test_indices)
-
-    np.random.seed(seed)
-    np.random.shuffle(test_indices)
-    num_val = int(val_ratio * num_test)
-    val_indices = test_indices[:num_val]
-    new_test_indices = test_indices[num_val:]
-
-    return val_indices, new_test_indices
-
 
 # =============================================================================
 # Main Experiment Entry Point

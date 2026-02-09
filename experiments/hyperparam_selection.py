@@ -22,38 +22,15 @@ from tqdm import tqdm
 from dattri.benchmark.load import load_benchmark
 from dattri.func.projection import make_random_projector, ProjectionType
 
-from utils.fisher_utils import (
+from utils.fisher import (
     compute_eigenspectrum,
-    project_gradients_to_cpu,
+    project_gradients,
     compute_kernel_from_projected,
+    safe_project,
 )
 from utils.gradient_cache import GradientCache, create_gradient_cache
-from utils.metrics_gpu import lds_gpu
-
-
-# =============================================================================
-# Safe Projection Helper
-# =============================================================================
-
-def safe_project(data: torch.Tensor, projector, d: int, ensemble_id: int = 0) -> torch.Tensor:
-    """
-    Safely project data, using identity (no projection) when m >= d.
-
-    Args:
-        data: Input tensor of shape (batch, d)
-        projector: Projector with .project() method and .proj_dim attribute
-        d: Original dimension
-        ensemble_id: Ensemble ID for projection
-
-    Returns:
-        Projected tensor of shape (batch, m) if m < d, else original tensor
-    """
-    m = projector.proj_dim
-    if m >= d:
-        # No projection needed when target dimension >= source dimension
-        return data
-    else:
-        return projector.project(data, ensemble_id=ensemble_id)
+from utils.metrics import lds
+from utils.data import get_validation_split_indices
 
 
 # =============================================================================
@@ -90,8 +67,8 @@ def compute_scores_sketched(
     # Auto-select method based on which dimension is smaller
     if n_train < m: # Use Woodbury method
         # 1. Project all gradients
-        PG_train = project_gradients_to_cpu(train_grad_cache, projector, device, batch_size)
-        PG_test = project_gradients_to_cpu(test_grad_cache, projector, device, batch_size)
+        PG_train = project_gradients(train_grad_cache, projector, device, batch_size)
+        PG_test = project_gradients(test_grad_cache, projector, device, batch_size)
 
         # 2. Compute kernel K = PG_train @ PG_train^T (not normalized)
         K = compute_kernel_from_projected(PG_train, device, batch_size, normalize=False)
@@ -181,29 +158,6 @@ def compute_scores_sketched(
 
         return scores
 
-
-def get_validation_split_indices(test_sampler, val_ratio=0.1, seed=0):
-    """
-    Get indices for validation and test splits without creating dataloaders.
-
-    Args:
-        test_sampler: Sampler for the test dataset
-        val_ratio: Fraction to use for validation
-        seed: Random seed for reproducibility
-
-    Returns:
-        Tuple of (val_indices, test_indices)
-    """
-    test_indices = list(test_sampler)
-    num_test = len(test_indices)
-
-    np.random.seed(seed)
-    np.random.shuffle(test_indices)
-    num_val = int(val_ratio * num_test)
-    val_indices = test_indices[:num_val]
-    new_test_indices = test_indices[num_val:]
-
-    return val_indices, new_test_indices
 
 
 def _get_gradient_info(grad_cache: GradientCache) -> Tuple[int, int, torch.dtype]:
@@ -422,12 +376,12 @@ def run_lambda_sweep(
 
             # Validation LDS (GPU-accelerated)
             val_scores_T = U @ (inv_diag.unsqueeze(1) * UT_Kval_T)
-            val_lds_score = lds_gpu(val_scores_T, val_gt, device=device)
+            val_lds_score = lds(val_scores_T, val_gt, device=device)
             mean_val_lds = torch.mean(val_lds_score[~torch.isnan(val_lds_score)]).item()
 
             # Test LDS (GPU-accelerated)
             test_scores_T = U @ (inv_diag.unsqueeze(1) * UT_Ktest_T)
-            test_lds_score = lds_gpu(test_scores_T, test_gt, device=device)
+            test_lds_score = lds(test_scores_T, test_gt, device=device)
             mean_test_lds = torch.mean(test_lds_score[~torch.isnan(test_lds_score)]).item()
 
             trial_results["lambda_values"].append(lamb)
@@ -572,7 +526,7 @@ def run_m_sweep(
                 train_grad_cache, val_grad_cache, projector, lamb, device, batch_size
             )
 
-            val_lds_score = lds_gpu(val_score, val_gt, device=device)
+            val_lds_score = lds(val_score, val_gt, device=device)
             mean_val_lds = torch.mean(val_lds_score[~torch.isnan(val_lds_score)]).item()
 
             per_m_trial_results[proj_dim].append(mean_val_lds)

@@ -12,7 +12,7 @@ from torch import Tensor
 from typing import Tuple
 
 
-def rank_data_gpu(data: Tensor, dim: int = 0) -> Tensor:
+def rank_data(data: Tensor, dim: int = 0) -> Tensor:
     """
     Compute ranks along dimension, fully vectorized on GPU.
 
@@ -29,7 +29,7 @@ def rank_data_gpu(data: Tensor, dim: int = 0) -> Tensor:
             data = data.unsqueeze(1)
         else:
             raise ValueError(
-                f"rank_data_gpu expected 2D tensor, got shape {data.shape} with {data.ndim} dimensions. "
+                f"rank_data expected 2D tensor, got shape {data.shape} with {data.ndim} dimensions. "
                 f"Input data type: {type(data)}"
             )
 
@@ -57,7 +57,7 @@ def rank_data_gpu(data: Tensor, dim: int = 0) -> Tensor:
     return ranks
 
 
-def spearman_correlation_gpu(x: Tensor, y: Tensor, dim: int = 0) -> Tensor:
+def spearman_correlation(x: Tensor, y: Tensor, dim: int = 0) -> Tensor:
     """
     Compute Spearman correlation on GPU using rank transformation.
 
@@ -77,8 +77,8 @@ def spearman_correlation_gpu(x: Tensor, y: Tensor, dim: int = 0) -> Tensor:
     y = y.double()
 
     # Compute ranks
-    x_ranks = rank_data_gpu(x, dim=dim)
-    y_ranks = rank_data_gpu(y, dim=dim)
+    x_ranks = rank_data(x, dim=dim)
+    y_ranks = rank_data(y, dim=dim)
 
     # Compute Pearson correlation of ranks
     # Correlation = cov(x, y) / (std(x) * std(y))
@@ -97,7 +97,7 @@ def spearman_correlation_gpu(x: Tensor, y: Tensor, dim: int = 0) -> Tensor:
     return correlation.float()
 
 
-def lds_gpu(score: Tensor, groundtruth: Tuple, device: str = "cuda") -> Tensor:
+def lds(score: Tensor, groundtruth: Tuple, device: str = "cuda") -> Tensor:
     """
     GPU-accelerated Linear Datamodeling Score (LDS) computation.
 
@@ -120,7 +120,7 @@ def lds_gpu(score: Tensor, groundtruth: Tuple, device: str = "cuda") -> Tensor:
         >>> score = torch.randn(1000, 50, device='cuda')
         >>> gt_values = torch.randn(100, 50, device='cuda')
         >>> subset_indices = torch.randint(0, 1000, (100, 25))
-        >>> lds_score = lds_gpu(score, (gt_values, subset_indices))
+        >>> lds_score = lds(score, (gt_values, subset_indices))
         >>> print(lds_score.shape)  # (50,)
     """
     gt_values, subset_indices = groundtruth
@@ -153,6 +153,6 @@ def lds_gpu(score: Tensor, groundtruth: Tuple, device: str = "cuda") -> Tensor:
         sum_scores[i] = score[subset_indices[i], :].sum(dim=0)
 
     # Compute Spearman correlation for each test sample (column)
-    lds_corr = spearman_correlation_gpu(sum_scores, gt_values, dim=0)
+    lds_corr = spearman_correlation(sum_scores, gt_values, dim=0)
 
     return lds_corr
